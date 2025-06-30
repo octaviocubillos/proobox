@@ -1,0 +1,174 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# --- Global Configuration Variables ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SCRIPTS_DIR="$SCRIPT_DIR/scripts"
+
+# --- Global Utility Functions ---
+command_exists () {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# --- Main Script Logic ---
+
+show_help() {
+  echo "Uso: ./termux-container [comando]"
+  echo ""
+  echo "Comandos disponibles:"
+  echo "  pull <imagen>[:<version>]  Descarga una imagen de contenedor (ej: ubuntu:22.04.3, alpine)."
+  echo "  image [subcomando]        Gestiona imágenes (ls, rm, tag)."
+  echo "  run [opciones] <imagen>[:<version>] [comando] [...] Ejecuta un contenedor."
+  echo "  ps [opciones]             Muestra los contenedores (en ejecución o todos)."
+  echo "  rm [opciones] <nombre_o_id> [...] Elimina uno o más contenedores."
+  echo "  start [opciones] <nombre_o_id>   Inicia un contenedor existente."
+  echo "  stop [opciones] <nombre_o_id>    Detiene un contenedor en ejecución."
+  echo "  restart [opciones] <nombre_o_id> Reinicia un contenedor."
+  echo "  build [opciones] <ruta_contexto> Construye una imagen a partir de un Buildfile."
+  echo "  exec [opciones] <nombre_o_id> <comando> [...] Ejecuta un comando en un contenedor en ejecución."
+  echo "  help                      Muestra esta ayuda."
+  echo ""
+  echo "Ejemplos:"
+  echo "  ./termux-container pull ubuntu:22.04.3"
+  echo "  ./termux-container run -d --name my_server ubuntu:22.04.3 sleep 3600"
+  echo "  ./termux-container stop my_server"
+  echo "  ./termux-container restart my_server"
+  echo "  ./termux-container build -t my_custom_app:latest ."
+}
+
+# If no arguments are provided, show help and exit
+if [ -z "$1" ]; then
+  show_help
+  exit 0
+fi
+
+# Process main command
+case "$1" in
+  pull)
+    if [ -z "$2" ]; then
+      echo "Error: Se esperaba imagen en formato 'distribucion:version' o 'distribucion'. Ej: pull ubuntu:22.04.3"
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/pull.sh" ]; then
+      "$SCRIPTS_DIR/pull.sh" "$2" 
+    else
+      echo "Error: Script de pull '$SCRIPTS_DIR/pull.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  image)
+    if [ -f "$SCRIPTS_DIR/image.sh" ]; then
+      "$SCRIPTS_DIR/image.sh" "${@:2}" 
+    else
+      echo "Error: Script de gestión de imágenes '$SCRIPTS_DIR/image.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  run)
+    if [ -z "$2" ]; then
+      echo "Error: Se esperaba imagen en formato 'distribucion:version' o 'distribucion'. Ej: run ubuntu:22.04.3"
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/run.sh" ]; then
+      "$SCRIPTS_DIR/run.sh" "${@:2}" 
+    else
+      echo "Error: Script de ejecución de contenedores '$SCRIPTS_DIR/run.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  ps)
+    if [ -f "$SCRIPTS_DIR/ps.sh" ]; then
+      "$SCRIPTS_DIR/ps.sh" "${@:2}" 
+    else
+      echo "Error: Script 'ps.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  rm)
+    if [ -z "$2" ]; then 
+      echo "Error: Se debe especificar al menos un contenedor para eliminar."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/rm.sh" ]; then
+      "$SCRIPTS_DIR/rm.sh" "${@:2}" 
+    else
+      echo "Error: Script 'rm.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  start) 
+    if [ -z "$2" ]; then
+      echo "Error: Se debe especificar el nombre o ID del contenedor a iniciar."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/start.sh" ]; then
+      "$SCRIPTS_DIR/start.sh" "${@:2}" 
+    else
+      echo "Error: Script 'start.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  stop) 
+    if [ -z "$2" ]; then
+      echo "Error: Se debe especificar el nombre o ID del contenedor a detener."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/stop.sh" ]; then
+      "$SCRIPTS_DIR/stop.sh" "${@:2}" 
+    else
+      echo "Error: Script 'stop.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  restart) 
+    if [ -z "$2" ]; then
+      echo "Error: Se debe especificar el nombre o ID del contenedor a reiniciar."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/restart.sh" ]; then
+      "$SCRIPTS_DIR/restart.sh" "${@:2}"
+    else
+      echo "Error: Script 'restart.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  build)
+    if [ -z "$2" ]; then
+      echo "Error: Se requiere un directorio de contexto para el comando 'build'."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/build.sh" ]; then
+      "$SCRIPTS_DIR/build.sh" "${@:2}"
+    else
+      echo "Error: Script 'build.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  exec) 
+    if [ -z "$2" ]; then
+      echo "Error: Se debe especificar el nombre o ID del contenedor para 'exec'."
+      show_help
+      exit 1
+    fi
+    if [ -f "$SCRIPTS_DIR/exec.sh" ]; then
+      "$SCRIPTS_DIR/exec.sh" "${@:2}"
+    else
+      echo "Error: Script 'exec.sh' no encontrado."
+      exit 1
+    fi
+    ;;
+  help)
+    show_help
+    ;;
+  *) # If command not recognized
+    echo "Error: Comando desconocido: $1"
+    show_help
+    exit 1
+    ;;
+esac
