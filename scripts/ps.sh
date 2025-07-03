@@ -3,7 +3,7 @@
 # Este script gestiona la visualización del estado de los contenedores.
 
 # --- Variables de Configuración Global ---
-CONTAINERS_DIR="$HOME/.termux-container/containers"
+CONTAINERS_DIR="$HOME/.proobox/containers"
 
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"

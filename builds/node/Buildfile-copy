@@ -1,0 +1,16 @@
+FROM alpine:3.22.0
+
+ENV NODE_VERSION 24.3.0
+
+
+ENV YARN_VERSION 1.22.22
+
+COPY step1.sh /tmp/script.sh
+RUN /bin/sh /tmp/script.sh
+RUN rm /tmp/script.sh
+
+
+COPY docker-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["docker-entrypoint.sh"]
+
+CMD [ "node" ]

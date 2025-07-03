@@ -1,0 +1,5 @@
+FROM alpine:3.22.0
+
+RUN apk --update add python3
+
+CMD ["python", "-v"]

@@ -6,24 +6,31 @@
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PULL_SCRIPT="$SCRIPT_DIR/pull.sh"
+UTILS_SCRIPT="$SCRIPT_DIR/utils.sh" # Aseguramos que utils.sh esté disponible
+
+# Cargar utils.sh para funciones como command_exists
+if [ -f "$UTILS_SCRIPT" ]; then
+  . "$UTILS_SCRIPT"
+else
+  echo "Error: No se encontró el script de utilidades '$UTILS_SCRIPT'. La funcionalidad de compilación podría ser limitada." >&2
+  exit 1
+fi
 
 # Cargar pull.sh (para download_image, get_mapped_architecture)
 if [ -f "$PULL_SCRIPT" ]; then
   . "$PULL_SCRIPT" 
 else
-  echo "Error: No se encontró el script de pull '$PULL_SCRIPT'. Funcionalidad de build limitada."
+  echo "Error: No se encontró el script de pull '$PULL_SCRIPT'. La funcionalidad de compilación podría ser limitada."
   exit 1
 fi
 
 # Directorios
-DOWNLOAD_IMAGES_DIR="$HOME/.termux-container/images" 
-CONTAINERS_DIR="$HOME/.termux-container/containers" 
-CACHED_IMAGES_DIR="$HOME/.termux-container/cached_images" # Directorio para cache de capas de build
+DOWNLOAD_IMAGES_DIR="$HOME/.proobox/images" 
+CONTAINERS_DIR="$HOME/.proobox/containers" 
+CACHED_IMAGES_DIR="$HOME/.proobox/cached_images" # Directorio para cache de capas de build
 
 # --- Funciones de Utilidad (locales a build.sh) ---
-command_exists () {
-  command -v "$1" >/dev/null 2>&1
-}
+# get_dir_hash y get_container_size_from_tar se mantienen aquí.
 
 # Función para calcular un hash SHA256 del contenido de un directorio.
 get_dir_hash() {
@@ -32,8 +39,6 @@ get_dir_hash() {
         echo "0" # Hash para directorio vacío o inexistente
         return
     fi 
-    # find + sort para asegurar orden consistente, luego sha256sum
-    # Pipe a sha256sum y tomar los primeros 12 caracteres para el ID corto
     find "$dir_path" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}' | head -c 12
 }
 
@@ -47,12 +52,30 @@ get_container_size_from_tar() {
     fi
 }
 
+# Obtiene la hora actual formateada como HH:MM:SS
+get_current_time() {
+    date +"%H:%M:%S"
+}
+
+# Calcula el tiempo transcurrido en segundos y lo formatea.
+format_elapsed_time() {
+    local start_time=$1
+    local end_time=$2
+    local elapsed=$((end_time - start_time))
+    if [ "$elapsed" -lt 1 ]; then
+        printf "%.1fs" "0.0" # Menos de 1 segundo, mostrar como 0.0s
+    else
+        echo "${elapsed}s"
+    fi
+}
 
 # --- Lógica Principal del Script build.sh ---
 main_build_logic() {
   local BUILD_FILE_PATH="Buildfile" # Por defecto
   local IMAGE_TAG_NAME="" # Nombre de la nueva imagen (ej. my_app:v1)
   local NO_CACHE=false # Opcional: --no-cache
+
+  local BUILD_START_TIME=$(date +%s) # Inicia el cronómetro total de la compilación
 
   show_build_help() {
     echo "Uso: build.sh [opciones] <ruta_contexto>"
@@ -66,9 +89,9 @@ main_build_logic() {
     echo "  --no-cache                 Deshabilita el uso de cache durante la construcción."
     echo ""
     echo "Ejemplos:"
-    echo "  ./termux-container build ."
-    echo "  ./termux-container build -t my_custom_ubuntu:latest /path/to/my/app/code"
-    echo "  ./termux-container build -f MyCustomBuildfile -t my_app:test ."
+    echo "  proobox build ."
+    echo "  proobox build -t my_custom_ubuntu:latest /path/to/my/app/code"
+    echo "  proobox build -f MyCustomBuildfile -t my_app:test ."
   }
 
   # Parseo de opciones
@@ -140,104 +163,170 @@ main_build_logic() {
     return 1
   fi
 
-  echo "--- Iniciando Construcción de Imagen ---"
-  echo "Buildfile: $BUILD_FILE_PATH"
-  echo "Contexto:  $BUILD_CONTEXT_PATH"
-  echo "Nueva Imagen (Tag): $IMAGE_TAG_NAME"
+  # --- Fase 1: Carga y Conteo de Pasos ---
+  # Leer Buildfile completo y pre-procesar líneas con '\'
+  local buildfile_content_temp=$(cat "$BUILD_FILE_PATH") 
+  local PROCESSED_BUILDFILE_LINES=()
+  local current_logical_line=""
+  local is_continuing_line=false
+  local TOTAL_BUILD_STEPS=0 # Contará solo RUN, COPY, WORKDIR, CMD, ENV
 
-  # 1. Leer el Buildfile y determinar la imagen base.
-  local FROM_LINE=$(grep -m 1 '^FROM ' "$BUILD_FILE_PATH")
-  if [ -z "$FROM_LINE" ]; then
-    echo "Error: Buildfile no contiene una línea 'FROM'."
-    return 1
+  while IFS= read -r raw_line; do
+    local trimmed_line=$(echo "$raw_line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') 
+    
+    if [ "$is_continuing_line" = true ]; then
+        current_logical_line+=" $trimmed_line"
+    else
+        current_logical_line="$trimmed_line"
+    fi
+
+    if [[ "$current_logical_line" =~ \\$ ]]; then
+        current_logical_line=$(echo "$current_logical_line" | sed 's/\\$//')
+        is_continuing_line=true
+        continue 
+    else
+        if [[ -n "$current_logical_line" ]] && ! [[ "$current_logical_line" =~ ^# ]]; then
+            local cmd_type=$(echo "$current_logical_line" | awk '{print $1}')
+            if [ "$cmd_type" != "FROM" ]; then # FROM no es un paso "contable" en la numeración de Docker.
+                PROCESSED_BUILDFILE_LINES+=("$current_logical_line")
+                TOTAL_BUILD_STEPS=$((TOTAL_BUILD_STEPS + 1))
+            else
+                # Almacenar la línea FROM por separado para usarla en el paso 1.
+                local FROM_LINE="$current_logical_line"
+            fi
+        fi
+        current_logical_line=""
+        is_continuing_line=false
+    fi
+  done < <(echo "$buildfile_content_temp")
+
+  if [ "$is_continuing_line" = true ]; then
+      echo "Error de sintaxis en Buildfile: El archivo termina con '\\' sin un comando de continuación." >&2
+      rm -rf "$BUILD_DATA_DIR"
+      return 1
   fi
+  # --- Fin de pre-procesamiento y conteo ---
 
+
+  echo -e "\nCompilando '${IMAGE_TAG_NAME}' $(get_current_time)"
+  # No mostramos [+] Building (X/Y) FINISHED aquí, sino al final.
+  # Mostramos los pasos internos iniciales de Docker.
+  local DOCKER_BUILD_INTERNAL_START_TIME=$(date +%s)
+  echo -n "$(get_current_time) => [internal] load build definition from Buildfile "
+  echo " (0.0s)" # Siempre 0s para esto en Docker
+  echo -n "$(get_current_time) => => transferring dockerfile: $(stat -c %s "$BUILD_FILE_PATH")B "
+  echo " (0.0s)"
+
+  # Cargar metadatos para la imagen base (FROM)
   local BASE_IMAGE_TAG=$(echo "$FROM_LINE" | awk '{print $2}')
-  if [ -z "$BASE_IMAGE_TAG" ]; then
-    echo "Error: La línea 'FROM' en el Buildfile no especifica una imagen base."
-    return 1
-  fi
-
-  echo "Imagen base especificada: $BASE_IMAGE_TAG"
-
-  # 2. Descargar la imagen base si no existe.
   local base_dist_name=$(echo "$BASE_IMAGE_TAG" | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
   local base_image_version=$(echo "$BASE_IMAGE_TAG" | cut -d':' -f2)
   local base_image_tar_path="${DOWNLOAD_IMAGES_DIR}/${base_dist_name}-${base_image_version}.tar.gz"
 
+  local START_METADATA_LOAD=$(date +%s)
+  echo -n "$(get_current_time) => [internal] load metadata for ${BASE_IMAGE_TAG} "
+  # Simular la descarga/carga de la capa FROM
   if [ ! -f "$base_image_tar_path" ]; then
-    echo "Imagen base '$BASE_IMAGE_TAG' no encontrada localmente. Descargando..."
     if ! download_image "$base_dist_name" "$base_image_version" "$(get_mapped_architecture)"; then
       echo "Error: Falló la descarga de la imagen base '$BASE_IMAGE_TAG'."
       return 1
     fi
-  else
-    echo "Imagen base '$BASE_IMAGE_TAG' encontrada localmente."
   fi
+  local END_METADATA_LOAD=$(date +%s)
+  ELAPSED_TIME=$((END_METADATA_LOAD - START_METADATA_LOAD))
+  echo " ($(format_elapsed_time $START_METADATA_LOAD $END_METADATA_LOAD))" # Tiempo para el paso metadata
+
+  echo -n "$(get_current_time) => [internal] load .dockerignore "
+  echo " (0.0s)" # Simula carga .dockerignore
+  echo -n "$(get_current_time) => => transferring context: $(du -b "$BUILD_CONTEXT_PATH" | awk '{print $1}')B "
+  echo " (0.0s)" # Simula transferencia de contexto
 
   # 3. Crear un contenedor temporal para la construcción.
-  local BUILD_CONTAINER_NAME="build-temp-$(head /dev/urandom | tr -dc a-z0-9 | head -c 12)" # ID más largo
+  local BUILD_CONTAINER_NAME="build-temp-$(head /dev/urandom | tr -dc a-z0-9 | head -c 12)" 
   local BUILD_ROOTFS="$CONTAINERS_DIR/$BUILD_CONTAINER_NAME/rootfs"
   local BUILD_DATA_DIR="$CONTAINERS_DIR/$BUILD_CONTAINER_NAME"
 
-  echo "Creando contenedor temporal para la construcción: $BUILD_CONTAINER_NAME"
   mkdir -p "$BUILD_DATA_DIR" || { echo "Error: No se pudo crear el directorio del contenedor temporal."; return 1; }
   mkdir -p "$BUILD_ROOTFS" || { echo "Error: No se pudo crear el rootfs del contenedor temporal."; return 1; }
 
   # --- Lógica de Cacheo para la capa FROM ---
-  # El ID de la capa FROM es un hash de la imagen base original.
-  # Usar un hash más corto para el nombre del directorio.
   local BASE_IMAGE_FULL_HASH=$(echo "$BASE_IMAGE_TAG" | sha256sum | awk '{print $1}')
   local BASE_IMAGE_SHORT_HASH=$(echo "$BASE_IMAGE_FULL_HASH" | head -c 12)
   local CACHE_FROM_PATH="$CACHED_IMAGES_DIR/layer-$BASE_IMAGE_SHORT_HASH"
-  mkdir -p "$CACHED_IMAGES_DIR" # Asegurar que el directorio de cache exista.
+  mkdir -p "$CACHED_IMAGES_DIR" 
 
+  START_TIME_STEP=$(date +%s)
+  local IS_FROM_CACHED=false
+  local STEP_STATUS="RUNNING"
   if [ -d "$CACHE_FROM_PATH" ] && [ "$NO_CACHE" = false ] && [ -n "$(ls -A "$CACHE_FROM_PATH" 2>/dev/null)" ]; then
-    echo "Usando capa FROM cacheadada para '$BASE_IMAGE_TAG'..."
+    echo -n "$(get_current_time) => CACHED [1/${TOTAL_BUILD_STEPS}] FROM ${BASE_IMAGE_TAG} "
     cp -a "$CACHE_FROM_PATH/." "$BUILD_ROOTFS" || { echo "Error: Falló la copia de la capa FROM cacheada."; rm -rf "$BUILD_DATA_DIR"; return 1; }
+    IS_FROM_CACHED=true
+    STEP_STATUS="CACHED"
   else
-    echo "Capa FROM no cacheada. Descomprimiendo imagen base en '$BUILD_ROOTFS'..."
+    echo -n "$(get_current_time) => [1/${TOTAL_BUILD_STEPS}] FROM ${BASE_IMAGE_TAG} "
     tar -xf "$base_image_tar_path" -C "$BUILD_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner || { echo "Error: Falló la descompresión de la imagen base."; rm -rf "$BUILD_DATA_DIR"; return 1; }
     
-    # Guardar la capa FROM en cache para futuros usos.
     if [ "$NO_CACHE" = false ]; then
-        echo "Guardando capa FROM en cache: '$CACHE_FROM_PATH'"
-        cp -a "$BUILD_ROOTFS/." "$CACHE_FROM_PATH" || { echo "Advertencia: Falló el cacheo de la capa FROM. No afectará la construcción actual."; }
+        cp -a "$BUILD_ROOTFS/." "$CACHE_FROM_PATH" || { echo "Advertencia: Falló el cacheo de la capa FROM."; }
     fi
   fi
+  END_TIME_STEP=$(date +%s)
+  ELAPSED_TIME=$(format_elapsed_time $START_TIME_STEP $END_TIME_STEP)
+  echo " (${ELAPSED_TIME})"
+
 
   # Configurar directorios especiales y DNS
   mkdir -p "$BUILD_ROOTFS/dev" "$BUILD_ROOTFS/proc" "$BUILD_ROOTFS/sys" "$BUILD_ROOTFS/tmp" "$BUILD_ROOTFS/run"
   chmod 1777 "$BUILD_ROOTFS/tmp"
   echo "nameserver 8.8.8.8" > "$BUILD_ROOTFS/etc/resolv.conf"
   echo "nameserver 8.8.4.4" >> "$BUILD_ROOTFS/etc/resolv.conf"
-  echo "Entorno base de construcción configurado (DNS a 8.8.8.8)."
 
   # 4. Ejecutar los comandos del Buildfile.
-  echo "Ejecutando pasos del Buildfile..."
-  
-  local STEP_COUNTER=0
-  local CURRENT_WORKDIR="/root" # Directorio de trabajo inicial en el contenedor
-  local FINAL_CMD_ARGS_JSON="null" # <--- Variable para el string JSON del CMD!
-  local LAST_LAYER_HASH="$BASE_IMAGE_SHORT_HASH" # Hash de la capa anterior para el cacheo
+  local CURRENT_WORKDIR="/root" 
+  local FINAL_CMD_ARGS_JSON="null" 
+  local LAST_LAYER_HASH="$BASE_IMAGE_SHORT_HASH" 
+  local ACCUMULATED_ENV_VARS_JSON="[]" # Acumula las variables ENV en JSON string
 
   # Variables de entorno estándar para el entorno de construcción de /usr/bin/env -i
-  local PROOT_BUILD_ENV_VARS=(
+  local PROOT_BUILD_ENV_VARS_BASE=( 
     "HOME=/root"
     "PATH=/usr/local/sbin:/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin:/usr/games:/usr/local/games"
     "TERM=xterm-256color" 
     "LANG=C.UTF-8"
   )
 
-  # Leer Buildfile línea por línea
-  while IFS= read -r line; do 
-    line=$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') # Eliminar espacios en blanco
-    if [[ -z "$line" || "$line" =~ ^# ]]; then continue; fi 
-    
+  # Función para obtener el array de variables de entorno COMBINADO para este paso
+  get_combined_env_vars_for_step() {
+      local combined_env_array=()
+      for base_var in "${PROOT_BUILD_ENV_VARS_BASE[@]}"; do
+          combined_env_array+=("$base_var")
+      done
+      if [ "$ACCUMULATED_ENV_VARS_JSON" != "null" ] && [ "$ACCUMULATED_ENV_VARS_JSON" != "[]" ]; then
+          while IFS= read -r env_item; do
+              combined_env_array+=("$env_item")
+          done < <(echo "$ACCUMULATED_ENV_VARS_JSON" | jq -r '.[]')
+      fi
+      printf "%s\n" "${combined_env_array[@]}"
+  }
+
+  local STEP_NUMBER_CURRENT=1 # Contador de pasos para [N/M], empieza desde 1 (después de FROM)
+  if [ "$IS_FROM_CACHED" = false ]; then # Si FROM no fue cacheado, ya lo contamos como 1.
+    STEP_NUMBER_CURRENT=1
+  fi
+  # Ajustar el contador para que los pasos después de FROM empiecen en el número correcto.
+  # El conteo TOTAL_BUILD_STEPS ya incluye todos los pasos del Buildfile excepto FROM.
+  # Así que el primer paso real (RUN, COPY, etc.) será 1 de TOTAL_BUILD_STEPS.
+
+  for line in "${PROCESSED_BUILDFILE_LINES[@]}"; do
     local COMMAND_TYPE=$(echo "$line" | awk '{print $1}')
     local COMMAND_ARGS_RAW=$(echo "$line" | cut -d' ' -f2-) 
     
-    # Pre-calculo del hash del comando para el cacheo
+    local DISPLAY_COMMAND_ARGS=$(echo "$COMMAND_ARGS_RAW" | head -c 20)
+    if [ "${#COMMAND_ARGS_RAW}" -gt 20 ]; then
+        DISPLAY_COMMAND_ARGS+="..."
+    fi
+
     local COMMAND_HASH=""
     if [ "$COMMAND_TYPE" == "COPY" ]; then
         local SOURCE_HOST_REL=$(echo "$COMMAND_ARGS_RAW" | awk '{print $1}')
@@ -259,19 +348,20 @@ main_build_logic() {
     local CACHE_LAYER_PATH="$CACHED_IMAGES_DIR/layer-$CURRENT_LAYER_ID"
     
     local SKIPPED_FROM_CACHE=false
+    local START_TIME_STEP=$(date +%s) 
+    local STEP_STATUS="RUNNING"
+
     if [ "$NO_CACHE" = false ] && [ -d "$CACHE_LAYER_PATH" ] && [ -n "$(ls -A "$CACHE_LAYER_PATH" 2>/dev/null)" ]; then
-        echo "--- Paso $STEP_COUNTER: Usando capa cacheada para '$COMMAND_TYPE $COMMAND_ARGS_RAW' ---"
+        echo -n "$(get_current_time) => CACHED [${STEP_NUMBER_CURRENT}/${TOTAL_BUILD_STEPS}] ${COMMAND_TYPE} ${DISPLAY_COMMAND_ARGS} "
         cp -a "$CACHE_LAYER_PATH/." "$BUILD_ROOTFS" || { echo "Error: Falló la copia de la capa cacheada. Abortando construcción."; rm -rf "$BUILD_DATA_DIR"; return 1; }
         SKIPPED_FROM_CACHE=true
+        STEP_STATUS="CACHED"
     else
-        STEP_COUNTER=$((STEP_COUNTER + 1)) # Solo incrementar si no se usa el cache
-        echo "--- Paso $STEP_COUNTER: $COMMAND_TYPE $COMMAND_ARGS_RAW ---"
-        echo "  Capa no cacheada. Ejecutando..."
+        echo -n "$(get_current_time) => [${STEP_NUMBER_CURRENT}/${TOTAL_BUILD_STEPS}] ${COMMAND_TYPE} ${DISPLAY_COMMAND_ARGS} "
     fi
 
-    unset LD_PRELOAD # Crucial antes de cada invocación de proot.
+    unset LD_PRELOAD 
 
-    # Construir los argumentos base de proot para este paso (sin /usr/bin/env ni comando final aún)
     local PROOT_BASE_ARGS=(
       proot
       --link2symlink
@@ -281,51 +371,49 @@ main_build_logic() {
       -b /data/data/com.termux:/data/data/com.termux -b /:/host-rootfs -b /sdcard -b /storage -b /mnt
     )
     
-    # Añadir bind-mount para Alpine si es necesario
     if [ "$base_dist_name" == "alpine" ]; then
         PROOT_BASE_ARGS+=("-b" "$BUILD_ROOTFS/bin/busybox:/bin/sh")
     fi
 
-    # Establecer el WORKDIR actual para el comando
     PROOT_BASE_ARGS+=("-w" "$CURRENT_WORKDIR")
-    PROOT_BASE_ARGS+=("--kill-on-exit") # Terminar proot al finalizar este paso.
+    PROOT_BASE_ARGS+=("--kill-on-exit")
 
 
     case "$COMMAND_TYPE" in
       FROM)
-        # FROM ya fue manejado al inicio, se ignora aquí.
+        # Esto ya fue manejado al inicio y no debería aparecer aquí.
         ;;
       RUN)
         if [ "$SKIPPED_FROM_CACHE" = false ]; then
-            # El comando a ejecutar es el shell adecuado para la distro, que interpretará COMMAND_ARGS_RAW.
             local RUN_SHELL="/bin/bash"
             if [ "$base_dist_name" == "alpine" ]; then RUN_SHELL="/bin/sh"; fi
             
-            # Construir el comando final para 'env -i' y el shell/comando
-            local ENV_AND_CMD_ARGS=("/usr/bin/env" "-i") # Iniciar env -i
-            ENV_AND_CMD_ARGS+=("${PROOT_BUILD_ENV_VARS[@]}") # Variables de entorno base
-            ENV_AND_CMD_ARGS+=("$RUN_SHELL" "-c" "$COMMAND_ARGS_RAW") # Shell y comando
+            local COMBINED_ENV_VARS_ARRAY=($(get_combined_env_vars_for_step))
+            local ENV_AND_CMD_ARGS=("/usr/bin/env" "-i") 
+            ENV_AND_CMD_ARGS+=("${COMBINED_ENV_VARS_ARRAY[@]}")
+            ENV_AND_CMD_ARGS+=("$RUN_SHELL" "-c" "$COMMAND_ARGS_RAW") 
             
-            echo "  Ejecutando: $COMMAND_ARGS_RAW"
-            "${PROOT_BASE_ARGS[@]}" "${ENV_AND_CMD_ARGS[@]}" # Ejecutar el comando proot completo
-            if [ $? -ne 0 ]; then
-              echo "Error: El paso 'RUN $COMMAND_ARGS_RAW' falló. Abortando construcción."
+            local STEP_LOG_FILE="$BUILD_DATA_DIR/step_${STEP_NUMBER_CURRENT}.log"
+            "${PROOT_BASE_ARGS[@]}" "${ENV_AND_CMD_ARGS[@]}" > "$STEP_LOG_FILE" 2>&1
+            local CMD_EXIT_CODE=$?
+
+            if [ "$CMD_EXIT_CODE" -ne 0 ]; then
+              echo -e "\nError: El paso 'RUN $DISPLAY_COMMAND_ARGS' falló con código $CMD_EXIT_CODE."
+              echo "Contenido del log del paso:"
+              cat "$STEP_LOG_FILE"
               rm -rf "$BUILD_DATA_DIR"
               return 1
             fi
             
-            # Guardar la capa en cache si no se ha saltado y no hay --no-cache
             if [ "$NO_CACHE" = false ]; then
-                echo "  Guardando capa en cache: '$CACHE_LAYER_PATH'"
                 mkdir -p "$CACHE_LAYER_PATH"
                 cp -a "$BUILD_ROOTFS/." "$CACHE_LAYER_PATH" || { echo "Advertencia: Falló el cacheo de la capa. No afectará la construcción actual."; }
             fi
         fi
-        LAST_LAYER_HASH="$CURRENT_LAYER_ID" # Actualizar hash de la última capa
+        LAST_LAYER_HASH="$CURRENT_LAYER_ID" 
         ;;
       COPY)
         if [ "$SKIPPED_FROM_CACHE" = false ]; then
-            # Sintaxis: COPY <origen_host_relativo> <destino_contenedor>
             local SOURCE_HOST_REL=$(echo "$COMMAND_ARGS_RAW" | awk '{print $1}')
             local DEST_CONTAINER=$(echo "$COMMAND_ARGS_RAW" | awk '{print $2}')
             local SOURCE_HOST_ABS="$BUILD_CONTEXT_PATH/$SOURCE_HOST_REL"
@@ -336,68 +424,106 @@ main_build_logic() {
                 return 1
             fi
 
-            # Para COPY, necesitamos montar el contexto de construcción dentro del contenedor temporal.
             PROOT_BASE_ARGS+=("-b" "$BUILD_CONTEXT_PATH:/host_build_context")
 
-            # El comando 'cp -a' dentro del contenedor.
             local CP_CMD="/bin/cp -a"
             if [ "$base_dist_name" == "alpine" ]; then CP_CMD="/bin/busybox cp -a"; fi
 
-            # Construir el comando final para 'env -i' y 'cp -a'.
+            local COMBINED_ENV_VARS_ARRAY=($(get_combined_env_vars_for_step)) 
             local ENV_AND_CMD_ARGS=("/usr/bin/env" "-i")
-            ENV_AND_CMD_ARGS+=("${PROOT_BUILD_ENV_VARS[@]}")
+            ENV_AND_CMD_ARGS+=("${COMBINED_ENV_VARS_ARRAY[@]}")
             local RUN_SHELL="/bin/bash" 
             if [ "$base_dist_name" == "alpine" ]; then RUN_SHELL="/bin/sh"; fi
-            # Asegurarse de que las rutas dentro del contenedor estén citadas.
             ENV_AND_CMD_ARGS+=("$RUN_SHELL" "-c" "$CP_CMD /host_build_context/\"$SOURCE_HOST_REL\" \"$DEST_CONTAINER\"")
 
-            echo "  Copiando '$SOURCE_HOST_REL' a '$DEST_CONTAINER' en el contenedor..."
-            "${PROOT_BASE_ARGS[@]}" "${ENV_AND_CMD_ARGS[@]}" # Ejecutar el comando proot completo
-            if [ $? -ne 0 ]; then
-              echo "Error: El paso 'COPY $COMMAND_ARGS_RAW' falló. Abortando construcción."
+            local STEP_LOG_FILE="$BUILD_DATA_DIR/step_${STEP_NUMBER_CURRENT}.log"
+            "${PROOT_BASE_ARGS[@]}" "${ENV_AND_CMD_ARGS[@]}" > "$STEP_LOG_FILE" 2>&1
+            local CMD_EXIT_CODE=$?
+
+            if [ "$CMD_EXIT_CODE" -ne 0 ]; then
+              echo "Error: El paso 'COPY $DISPLAY_COMMAND_ARGS' falló con código $CMD_EXIT_CODE."
+              echo "Contenido del log del paso:"
+              cat "$STEP_LOG_FILE"
               rm -rf "$BUILD_DATA_DIR"
               return 1
             fi
             
-            # Guardar la capa en cache si no se ha saltado y no hay --no-cache
             if [ "$NO_CACHE" = false ]; then
-                echo "  Guardando capa en cache: '$CACHE_LAYER_PATH'"
                 mkdir -p "$CACHE_LAYER_PATH"
                 cp -a "$BUILD_ROOTFS/." "$CACHE_LAYER_PATH" || { echo "Advertencia: Falló el cacheo de la capa. No afectará la construcción actual."; }
             fi
         fi
-        LAST_LAYER_HASH="$CURRENT_LAYER_ID" # Actualizar hash de la última capa
+        LAST_LAYER_HASH="$CURRENT_LAYER_ID" 
         ;;
       WORKDIR)
-        # Actualizamos el directorio de trabajo actual para las próximas invocaciones de proot.
         CURRENT_WORKDIR="$COMMAND_ARGS_RAW"
-        echo "  Estableciendo WORKDIR: $CURRENT_WORKDIR"
-        # WORKDIR no genera una nueva capa, solo cambia el estado para el hashing de futuras capas.
+        LAST_LAYER_HASH="$CURRENT_LAYER_ID" 
         ;;
       CMD)
-        # Se guarda el CMD para la imagen final.
-        # CAPTURA EL STRING JSON DEL CMD TAL CUAL APARECE EN EL BUILDFILE.
         FINAL_CMD_ARGS_JSON="$COMMAND_ARGS_RAW" 
-        echo "  Comando predeterminado (CMD) guardado: $FINAL_CMD_ARGS_JSON"
+        LAST_LAYER_HASH="$CURRENT_LAYER_ID" 
+        ;;
+      ENV) 
+        local env_arg_split=""
+        if [[ "$COMMAND_ARGS_RAW" =~ ^[^=]+= ]]; then 
+            ACCUMULATED_ENV_VARS_JSON=$(echo "$ACCUMULATED_ENV_VARS_JSON" | jq --arg new_env "$COMMAND_ARGS_RAW" '. += [$new_env]')
+        elif [ -n "$(echo "$COMMAND_ARGS_RAW" | awk '{print $1}')" ]; then 
+            local env_key=$(echo "$COMMAND_ARGS_RAW" | awk '{print $1}')
+            local env_value=$(echo "$COMMAND_ARGS_RAW" | cut -d' ' -f2-)
+            ACCUMULATED_ENV_VARS_JSON=$(echo "$ACCUMULATED_ENV_VARS_JSON" | jq --arg name "$env_key" --arg value "$env_value" '. += ["\($name)=\($value)"]')
+        else
+            echo "Advertencia: Formato de ENV inválido '$COMMAND_ARGS_RAW'. Saltando." >&2
+        fi
+        LAST_LAYER_HASH="$CURRENT_LAYER_ID" 
         ;;
       *)
-        echo "Advertencia: Comando de Buildfile desconocido '$COMMAND_TYPE'. Saltando."
+        echo "Advertencia: Comando de Buildfile desconocido '$COMMAND_TYPE'. Saltando." >&2 
         ;;
     esac
-  done < "$BUILD_FILE_PATH" # <--- ¡Aquí se lee el Buildfile directamente!
+    # Solo incrementar el STEP_NUMBER_DISPLAY si no se saltó este paso.
+    # El tiempo transcurrido se muestra después de cada paso.
+    # Los mensajes de "Estableciendo WORKDIR" o "Comando predeterminado" ya no necesitan su propio 'echo -n'.
+    if [ "$SKIPPED_FROM_CACHE" = false ]; then
+        if [ "$COMMAND_TYPE" == "WORKDIR" ]; then
+            echo -e "Estableciendo WORKDIR: ${DISPLAY_COMMAND_ARGS} "
+        elif [ "$COMMAND_TYPE" == "CMD" ]; then
+            echo -e "Comando predeterminado (CMD) guardado: ${DISPLAY_COMMAND_ARGS} "
+        elif [ "$COMMAND_TYPE" == "ENV" ]; then
+            echo -e "Estableciendo variable de entorno: ${DISPLAY_COMMAND_ARGS} "
+        fi
+    fi
 
-  echo "--- Pasos del Buildfile finalizados ---"
+    local END_TIME_STEP=$(date +%s)
+    local ELAPSED_TIME_FORMATTED=$(format_elapsed_time $START_TIME_STEP $END_TIME_STEP)
+    echo " (${ELAPSED_TIME_FORMATTED})"
 
+    # Solo incrementar el número de paso si NO es un paso CACHED.
+    # El STEP_NUMBER_DISPLAY ya está diseñado para avanzar con cada línea lógica real.
+    # Si SKIPPED_FROM_CACHE es true, el STEP_NUMBER_DISPLAY no se incrementa.
+    # Ya está bien manejado con STEP_NUMBER_DISPLAY=$((STEP_NUMBER_DISPLAY + 1)) dentro del if/else.
+    STEP_NUMBER_CURRENT=$((STEP_NUMBER_CURRENT + 1)) # Incrementar el contador para el display
+    if [ "$STEP_NUMBER_CURRENT" -gt "$TOTAL_BUILD_STEPS" ]; then
+        break # Si superamos los pasos totales, salir del bucle.
+    fi
+
+  done # Cierre del bucle for sobre PROCESSED_BUILDFILE_LINES
+
+  local BUILD_END_TIME=$(date +%s)
+  local TOTAL_BUILD_ELAPSED_TIME=$((BUILD_END_TIME - BUILD_START_TIME))
+
+  echo -e "\n[+] Building $(format_elapsed_time $BUILD_START_TIME $BUILD_END_TIME) FINISHED ${IMAGE_TAG_NAME}" # Resumen final
+  
   # 5. Guardar la nueva imagen.
   local NEW_IMAGE_DIST_NAME=$(echo "$IMAGE_TAG_NAME" | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
   local NEW_IMAGE_VERSION_TAG=$(echo "$IMAGE_TAG_NAME" | cut -d':' -f2)
-  if [ -z "$NEW_IMAGE_VERSION_TAG" ]; then NEW_IMAGE_VERSION_TAG="latest"; fi # Etiqueta por defecto
+  if [ -z "$NEW_IMAGE_VERSION_TAG" ]; then NEW_IMAGE_VERSION_TAG="latest"; fi 
 
   local NEW_IMAGE_FILENAME="${NEW_IMAGE_DIST_NAME}-${NEW_IMAGE_VERSION_TAG}.tar.gz"
   local NEW_IMAGE_PATH="${DOWNLOAD_IMAGES_DIR}/${NEW_IMAGE_FILENAME}"
 
-  echo "Guardando el estado del contenedor '$BUILD_CONTAINER_NAME' como nueva imagen '$IMAGE_TAG_NAME'..."
-  # Crear el tar.gz del rootfs del contenedor temporal.
+  # Mostrando la línea final de exportación como Docker
+  echo -n "$(get_current_time) => exporting to image "
+  local EXPORT_START_TIME=$(date +%s)
   tar -czf "$NEW_IMAGE_PATH" \
       --exclude='dev/*' \
       --exclude='proc/*' \
@@ -405,37 +531,28 @@ main_build_logic() {
       --exclude='tmp/*' \
       --exclude='run/*' \
       -C "$BUILD_ROOTFS" . || { echo "Error: Falló al crear la imagen TAR.GZ."; rm -rf "$BUILD_DATA_DIR"; return 1; }
-
-  if [ $? -eq 0 ]; then
-    echo "¡Imagen '$IMAGE_TAG_NAME' creada con éxito en '$NEW_IMAGE_PATH'!"
-  else
-    echo "Error: Falló la creación de la imagen '$IMAGE_TAG_NAME'."
-    rm -rf "$BUILD_DATA_DIR"
-    return 1
-  fi
-
+  local EXPORT_END_TIME=$(date +%s)
+  local EXPORT_ELAPSED_TIME=$(format_elapsed_time $EXPORT_START_TIME $EXPORT_END_TIME)
+  echo " (${EXPORT_ELAPSED_TIME})"
+  
+  local METADATA_WRITE_START_TIME=$(date +%s)
   # --- Guardar metadatos de la imagen ---
   local IMAGE_METADATA_FILE="$DOWNLOAD_IMAGES_DIR/${NEW_IMAGE_DIST_NAME}-${NEW_IMAGE_VERSION_TAG}.json"
   local CURRENT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%S.%N%z)
   local IMAGE_ID=$(echo "$NEW_IMAGE_PATH" | md5sum | cut -d' ' -f1)
 
-  # Asegurarse de que FINAL_CMD_ARGS_JSON sea un string JSON válido.
   local FINAL_CMD_JSON_FOR_METADATA_CLEAN="null"
   if command_exists jq; then
-      if echo "$FINAL_CMD_ARGS_JSON" | jq -e '.|type == "array"' >/dev/null 2>&1; then
+      if echo "$FINAL_CMD_ARGS_JSON" | jq -e 'if type == "array" then . else empty end' >/dev/null 2>&1; then
           FINAL_CMD_JSON_FOR_METADATA_CLEAN="$FINAL_CMD_ARGS_JSON"
-      else
-          echo "Advertencia: CMD en Buildfile no parece un array JSON válido. Guardando como null."
-          FINAL_CMD_JSON_FOR_METADATA_CLEAN="null"
       fi
   else
-      echo "Advertencia: 'jq' no está instalado. No se puede validar el formato JSON del CMD en Buildfile."
-      echo "Asegúrese de que el CMD en su Buildfile esté en formato JSON de array (ej: [\"/bin/bash\", \"--login\"])."
-      FINAL_CMD_JSON_FOR_METADATA_CLEAN="$FINAL_CMD_ARGS_JSON" 
+      if [ -n "$FINAL_CMD_ARGS_JSON" ]; then
+          FINAL_CMD_JSON_FOR_METADATA_CLEAN="$FINAL_CMD_ARGS_JSON"
+      fi
   fi
 
   local FINAL_WORKDIR_FOR_METADATA="${CURRENT_WORKDIR}" 
-
 
   cat << EOF > "$IMAGE_METADATA_FILE"
 {
@@ -447,20 +564,22 @@ main_build_logic() {
   "ContainerConfig": {
     "Cmd": $FINAL_CMD_JSON_FOR_METADATA_CLEAN,
     "WorkingDir": "$FINAL_WORKDIR_FOR_METADATA",
-    "Entrypoint": null 
+    "Entrypoint": null,
+    "Env": $ACCUMULATED_ENV_VARS_JSON 
   },
   "Os": "linux",
   "Architecture": "$(get_mapped_architecture)"
 }
 EOF
-  echo "Metadatos de la imagen guardados en: $IMAGE_METADATA_FILE"
-  # --- FIN Guardado de metadatos de la imagen ---
+  local METADATA_WRITE_END_TIME=$(date +%s)
+  local METADATA_WRITE_ELAPSED_TIME=$(format_elapsed_time $METADATA_WRITE_START_TIME $METADATA_WRITE_END_TIME)
+  echo -e "$(get_current_time) => => writing image sha256:${IMAGE_ID} (${METADATA_WRITE_ELAPSED_TIME})"
+  echo -e "$(get_current_time) => => naming => /library/${IMAGE_TAG_NAME} (${METADATA_WRITE_ELAPSED_TIME})" 
 
   # 6. Limpiar el contenedor temporal de construcción.
-  echo "Limpiando contenedor temporal '$BUILD_CONTAINER_NAME'..."
   rm -rf "$BUILD_DATA_DIR"
 
-  echo "--- Proceso de construcción finalizado ---"
+  echo "------------------------------------------------------------" 
   return 0
 }
 

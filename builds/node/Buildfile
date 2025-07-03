@@ -1,0 +1,5 @@
+FROM alpine:3.22.0
+RUN apk add --update nodejs npm
+RUN adduser -D -g 'node' node
+
+CMD ["node", "-v"]

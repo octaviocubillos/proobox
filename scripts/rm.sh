@@ -3,7 +3,7 @@
 # Este script se encarga de eliminar contenedores.
 
 # --- Variables de Configuración Global ---
-CONTAINERS_DIR="$HOME/.termux-container/containers"
+CONTAINERS_DIR="$HOME/.proobox/containers"
 
 # --- Funciones de Utilidad ---
 command_exists () {

@@ -3,7 +3,7 @@
 # Este script permite ejecutar comandos dentro de un contenedor en ejecución.
 
 # --- Variables de Configuración Global ---
-CONTAINERS_DIR="$HOME/.termux-container/containers"
+CONTAINERS_DIR="$HOME/.proobox/containers"
 
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -32,7 +32,7 @@ fi
 # Determina si un proceso proot está en ejecución para un contenedor dado.
 is_running() { # Copiado de ps.sh para que exec.sh lo use
     local container_name="$1"
-    local containers_dir_path="$HOME/.termux-container/containers" # Definir aquí o pasar
+    local containers_dir_path="$HOME/.proobox/containers" # Definir aquí o pasar
     local rootfs_path_escaped=$(echo "$containers_dir_path/$container_name/rootfs" | sed 's/\//\\\//g')
     if pgrep -f "proot.*-r $rootfs_path_escaped" >/dev/null; then
         echo "Running"

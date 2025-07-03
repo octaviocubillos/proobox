@@ -1,0 +1,8 @@
+FROM alpine:3.22.0
+
+# Copia el script del contador al contenedor y hazlo ejecutable
+COPY start_counter.sh /usr/local/bin/start_counter.sh
+RUN chmod +x /usr/local/bin/start_counter.sh
+
+# Define el comando por defecto para ejecutar el script del contador
+CMD ["/usr/local/bin/start_counter.sh"]

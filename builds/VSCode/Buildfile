@@ -1,0 +1,21 @@
+FROM ubuntu:24.04.2
+
+# Install necessary packages
+RUN apt-get update && apt-get install -y curl gnupg
+
+# Add code-server repository and key
+RUN curl -fsSL https://code-server.dev/install.sh | sh
+
+# Set up a user
+RUN useradd -m -s /bin/bash vscode
+RUN chown -R vscode:vscode /home/vscode
+
+# Set environment variables for code-server
+ENV PASSWORD=12345 # Replace with your desired password
+ENV HOME=/home/vscode
+
+# Expose the port
+EXPOSE 8080
+
+# Start code-server
+CMD ["code-server", "--port", "8081", "--host", "0.0.0.0"]

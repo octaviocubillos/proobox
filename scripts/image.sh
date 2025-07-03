@@ -3,8 +3,8 @@
 # Este script gestiona las imágenes de contenedores en el sistema.
 
 # --- Variables de Configuración Global ---
-DOWNLOAD_IMAGES_DIR="$HOME/.termux-container/images"
-CONTAINERS_DIR="$HOME/.termux-container/containers" # Necesario para is_running
+DOWNLOAD_IMAGES_DIR="$HOME/.proobox/images"
+CONTAINERS_DIR="$HOME/.proobox/containers" # Necesario para is_running
 
 # --- Funciones de Utilidad ---
 # Función para verificar si un comando existe en el PATH.

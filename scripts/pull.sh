@@ -5,10 +5,10 @@
 
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-UTILS_SCRIPT="$SCRIPT_DIR/utils.sh" # Ruta al script de utilidades.
-METADATA_SCRIPT_PULL="$SCRIPT_DIR/metadata.sh" # Ruta al script de metadatos.
+UTILS_SCRIPT="$SCRIPT_DIR/utils.sh"
+METADATA_SCRIPT_PULL="$SCRIPT_DIR/metadata.sh"
 
-# Cargar utils.sh (para command_exists)
+# Cargar utilidades. command_exists estará disponible.
 if [ -f "$UTILS_SCRIPT" ]; then
   . "$UTILS_SCRIPT"
 else
@@ -16,53 +16,35 @@ else
   exit 1
 fi
 
-# Cargar metadata.sh si está disponible (para generate_container_metadata)
+# Cargar metadata.sh. Confía en que sus funciones (como generate_image_metadata) estarán disponibles.
 if [ -f "$METADATA_SCRIPT_PULL" ]; then
-  . "$METADATA_SCRIPT_PULL" 
-  if ! command_exists generate_container_metadata; then
-      echo "Error: La función 'generate_container_metadata' no se cargó correctamente desde '$METADATA_SCRIPT_PULL'." >&2
-      echo "Asegúrate de que 'metadata.sh' sea un script de Bash válido y tenga permisos." >&2
-      # No salimos aquí, ya que pull.sh aún puede descargar el tar.gz, solo no generará metadatos.
-  fi
+  . "$METADATA_SCRIPT_PULL"
 else
-  echo "Advertencia: metadata.sh no encontrado en '$METADATA_SCRIPT_PULL'. No se generarán metadatos para la imagen descargada." >&2
+  echo "Error crítico: metadata.sh no encontrado en '$METADATA_SCRIPT_PULL'. No se generarán metadatos para la imagen descargada." >&2
+  exit 1
 fi
 
 
 # --- Variables de Configuración Global ---
-DOWNLOAD_BASE_DIR="$HOME/.termux-container"
-DOWNLOAD_IMAGES_DIR="$DOWNLOAD_BASE_DIR/images"
+DOWNLOAD_BASE_DIR="$HOME/.proobox" # Base dir for all PRooBox data
+DOWNLOAD_IMAGES_DIR="$DOWNLOAD_BASE_DIR/images" # Directory to store downloaded images
+REPO_CONFIG_FILE="$PROOBOX_BASE_DIR/config.json" # Ruta al archivo de configuración del repo
+
 
 # --- Funciones de Descarga de Imágenes ---
 
-# Función para determinar y mapear la arquitectura del sistema.
-get_mapped_architecture() { # Esta función ya no necesita 'command_exists' aquí si utils.sh se carga.
+# Determina y mapea la arquitectura del sistema.
+get_mapped_architecture() { 
   local termux_arch=$(dpkg --print-architecture)
-  local mapped_arch=""
-
   case "$termux_arch" in
-    aarch64) mapped_arch="arm64";; # Mapea a 'arm64' para Ubuntu, 'aarch64' para Alpine
-    arm) mapped_arch="armhf";;    # Para ARM de 32 bits
-    amd64|x86_64) mapped_arch="amd64";; # Para emulación x86_64 o dispositivos compatibles
-    *)
-      echo "Error: Arquitectura '$termux_arch' no soportada para descarga de imágenes." >&2
-      return 1
-      ;;
+    aarch64) echo "arm64";;
+    arm) echo "armhf";;
+    amd64|x86_64) echo "amd64";;
+    *) echo "Error: Arquitectura '$termux_arch' no soportada para descarga de imágenes." >&2; return 1;;
   esac
-  echo "$mapped_arch"
 }
 
-# Función auxiliar para obtener el tamaño de un archivo tar.gz
-get_container_size_from_tar() { # Necesaria para metadatos de imagen
-    local tar_path="$1"
-    if [ -f "$tar_path" ]; then
-        du -h "$tar_path" | awk '{print $1}'
-    else
-        echo "0B"
-    fi
-}
-
-# Función auxiliar para obtener la última versión de Alpine (solo para Alpine).
+# Obtiene la última versión estable de Alpine desde su CDN.
 get_latest_alpine_version() {
   local latest_version=""
   local release_url="https://dl-cdn.alpinelinux.org/alpine/releases/"
@@ -75,225 +57,236 @@ get_latest_alpine_version() {
 
   if [ -z "$latest_version" ]; then
     echo "Advertencia: No se pudo determinar la última versión de Alpine desde $release_url. Usando 3.20 como fallback."
-    echo "Considere especificar la versión explícitamente (ej: alpine:3.22.0)."
-    latest_version="3.20" 
+    latest_version="3.20"
   fi
   echo "$latest_version"
 }
 
-# Función principal para descargar imágenes oficiales.
+# Función para normalizar la cadena de versión (ej. "1" -> "1.0.0", "2.5" -> "2.5.0").
+# Esto es una copia de la función de utils.sh para asegurar que pull.sh la tenga disponible.
+normalize_image_version() {
+  local version_str="$1"
+  if [ -z "$version_str" ]; then
+      echo ""
+      return
+  fi
+
+  if [[ "$version_str" =~ ^[0-9]+$ ]]; then # Si es solo un número entero
+      echo "${version_str}.0.0"
+      return
+  fi
+  
+  if [[ "$version_str" =~ ^[0-9]+\.[0-9]+$ ]]; then # Si es X.Y
+      echo "${version_str}.0"
+      return
+  fi
+  
+  echo "$version_str" # Retorna la cadena original si no coincide con los patrones
+}
+
+# Función principal para descargar imágenes.
+# Retorna 0 si la descarga fue exitosa, 1 si falló.
 download_image() {
   local distribution_name_arg="$1" 
   local image_version_arg="$2"     
   local target_arch_arg="$3"       
 
+  # Asegurarse de que el nombre de la distribución siempre esté en minúsculas.
+  distribution_name_arg=$(echo "$distribution_name_arg" | tr '[:upper:]' '[:lower:]')
+
   echo "--- Descargando Imagen ${distribution_name_arg^} ---"
 
-  # Determinar la versión si no se proporciona (solo para Alpine)
+  # Normalizar la versión y manejar la lógica de "latest" o versión predeterminada.
   if [ -z "$image_version_arg" ]; then
-    echo "No se especificó la versión. Intentando obtener la última versión estable de ${distribution_name_arg^}..."
     if [ "$distribution_name_arg" == "alpine" ]; then
       image_version_arg=$(get_latest_alpine_version)
       if [ -z "$image_version_arg" ]; then
-        echo "Error: No se pudo determinar la última versión de Alpine y no se especificó. Abortando descarga."
-        return 1 
+        echo "Error: No se pudo determinar la última versión de Alpine. Abortando descarga." >&2
+        return 1
       fi
-      echo "Última versión de Alpine detectada: ${image_version_arg}"
+    elif [ "$distribution_name_arg" == "ubuntu" ]; then
+        echo "Error: La versión debe especificarse para ${distribution_name_arg^}. Ej: ${distribution_name_arg}:22.04.3." >&2
+        return 1
     else
-      echo "Error: La detección automática de la última versión no está implementada para ${distribution_name_arg^}. Por favor, especifica la versión (ej: ${distribution_name_arg}:22.04.3)."
-      return 1 
+        echo "Error: No se puede determinar la última versión para '${distribution_name_arg}'. Por favor, especifica la versión." >&2
+        return 1
     fi
   fi
 
-  # Determinar la arquitectura de la máquina Termux
-  local current_host_arch=$(get_mapped_architecture)
-  if [ $? -ne 0 ]; then
-    echo "$current_host_arch" 
-    return 1
+  # Normalizar la cadena de versión (ej. "1" -> "1.0.0", "2.5" -> "2.5.0")
+  local normalized_image_version="$image_version_arg"
+  if [[ "$normalized_image_version" =~ ^[0-9]+$ ]]; then
+      normalized_image_version="${normalized_image_version}.0.0"
+  elif [[ "$normalized_image_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+      normalized_image_version="${normalized_image_version}.0"
   fi
-  
-  local download_arch="${target_arch_arg:-$current_host_arch}" 
+  image_version_arg="$normalized_image_version"
 
+
+  local current_host_arch=$(get_mapped_architecture)
+  if [ $? -ne 0 ]; then echo "$current_host_arch"; return 1; fi
+  local download_arch="${target_arch_arg:-$current_host_arch}" 
   echo "Arquitectura detectada para descarga: $download_arch"
 
-  # Verificar dependencias esenciales para la descarga
-  echo "Verificando dependencias..."
-  if ! command_exists wget; then # Usa command_exists de utils.sh
-    echo "Error: 'wget' no está instalado. Por favor, instálalo con 'pkg install wget'."
+  if ! command_exists wget; then
+    echo "Error: 'wget' no está instalado. Por favor, instálalo con 'pkg install wget'." >&2
     return 1
   fi
-  echo "'wget' detectado."
 
-  local DOWNLOAD_URL=""
-  local LOCAL_IMAGE_FILENAME=""
+  # Rutas de archivos locales
+  local LOCAL_IMAGE_TAR_FILENAME="${distribution_name_arg}-${image_version_arg}.tar.gz"
+  local LOCAL_IMAGE_JSON_FILENAME="${distribution_name_arg}-${image_version_arg}.json"
+  local LOCAL_TAR_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_TAR_FILENAME"
+  local LOCAL_JSON_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_JSON_FILENAME"
 
-  # Lógica específica para construir la URL de descarga y el nombre del archivo local.
-  case "$distribution_name_arg" in
-    alpine)
-      local ALPINE_ARCH_FOR_URL="aarch64"
-      if [ "$download_arch" == "arm64" ]; then 
-          ALPINE_ARCH_FOR_URL="aarch64"
-      elif [ "$download_arch" == "amd64" ]; then
-          ALPINE_ARCH_FOR_URL="x86_64" 
-      elif [ "$download_arch" == "armhf" ]; then
-          ALPINE_ARCH_FOR_URL="armhf" 
-      else
-          echo "Error: Arquitectura '$download_arch' no compatible con las URLs de Alpine."
-          return 1
-      fi
+  # Crear directorio de imágenes si no existe
+  mkdir -p "$DOWNLOAD_IMAGES_DIR"
 
-      local ALPINE_MAJOR_MINOR_VERSION=$(echo "$image_version_arg" | cut -d'.' -f1-2)
-      DOWNLOAD_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_MAJOR_MINOR_VERSION}/releases/${ALPINE_ARCH_FOR_URL}/alpine-minirootfs-${image_version_arg}-${ALPINE_ARCH_FOR_URL}.tar.gz"
-      LOCAL_IMAGE_FILENAME="${distribution_name_arg}-${image_version_arg}.tar.gz"
-      ;;
-    ubuntu)
-      # URL de Ubuntu Oficial (para Ubuntu 22.04.3 LTS base)
-      # Ejemplo: http://cdimage.ubuntu.com/ubuntu-base/releases/22.04.3/release/ubuntu-base-22.04.3-base-arm64.tar.gz
-      
-      local UBUNTU_ARCH_FOR_URL=""
-      if [ "$download_arch" == "arm64" ]; then
-          UBUNTU_ARCH_FOR_URL="arm64"
-      elif [ "$download_arch" == "amd64" ]; then
-          UBUNTU_ARCH_FOR_URL="amd64"
-      elif [ "$download_arch" == "armhf" ]; then
-          UBUNTU_ARCH_FOR_URL="armhf" 
-      else
-          echo "Error: Ubuntu no está disponible para la arquitectura '$download_arch'."
-          return 1
-      fi
-
-      local UBUNTU_VERSION_IN_URL="${image_version_arg}" 
-      
-      DOWNLOAD_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION_IN_URL}/release/ubuntu-base-${image_version_arg}-base-${UBUNTU_ARCH_FOR_URL}.tar.gz"
-      LOCAL_IMAGE_FILENAME="ubuntu-${image_version_arg}.tar.gz"
-      ;;
-    *)
-      echo "Error interno: La distribución '$distribution_name_arg' no tiene una lógica de descarga definida."
-      return 1 
-      ;;
-  esac 
-
-  local IMAGE_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_FILENAME"
-
-  # Crear los directorios de almacenamiento si no existen.
-  if [ ! -d "$DOWNLOAD_BASE_DIR" ]; then
-    echo "Creando directorio base: $DOWNLOAD_BASE_DIR"
-    mkdir -p "$DOWNLOAD_BASE_DIR"
-  fi
-  if [ ! -d "$DOWNLOAD_IMAGES_DIR" ]; then
-    echo "Creando directorio de imágenes: $DOWNLOAD_IMAGES_DIR"
-    mkdir -p "$DOWNLOAD_IMAGES_DIR"
-  else
-    echo "El directorio de imágenes ya existe: $DOWNLOAD_IMAGES_DIR"
+  # Si la imagen ya existe localmente (TAR y JSON válidos), saltar la descarga.
+  if [ -f "$LOCAL_TAR_PATH" ] && [ -f "$LOCAL_JSON_PATH" ]; then
+      echo "La imagen '$LOCAL_IMAGE_TAR_FILENAME' ya existe en '$DOWNLOAD_IMAGES_DIR'. Saltando la descarga."
+      return 0
   fi
 
-  # Descargar la imagen si no existe localmente.
-  echo "Intentando descargar la imagen de ${distribution_name_arg^} (versión ${image_version_arg}, arquitectura ${download_arch})..."
-  echo "URL de descarga: $DOWNLOAD_URL"
+  local DOWNLOAD_FINAL_STATUS=1 # 0 para éxito, 1 para fallo
 
-  if [ -f "$IMAGE_PATH" ]; then
-    echo "La imagen '$LOCAL_IMAGE_FILENAME' ya existe en '$DOWNLOAD_IMAGES_DIR'. Saltando la descarga."
-  else
-    wget -O "$IMAGE_PATH" "$DOWNLOAD_URL"
+  # --- OBTENER CONFIGURACIÓN DE MINIO PARA PULL ---
+  local MINIO_PULL_ENDPOINT=""
+  local MINIO_PULL_PORT=""
+  local MINIO_BUCKET="proobox-images" # El mismo bucket de push.sh
+
+  if [ -f "$REPO_CONFIG_FILE" ]; then
+      MINIO_PULL_ENDPOINT=$(jq -r '.minio.endpoint' "$REPO_CONFIG_FILE" 2>/dev/null)
+      MINIO_PULL_PORT=$(jq -r '.minio.port' "$REPO_CONFIG_FILE" 2>/dev/null)
+  fi
+
+  # --- Intentar descargar desde MinIO (si configurado y válido) ---
+  if [ -n "$MINIO_PULL_ENDPOINT" ] && \
+     [ "$MINIO_PULL_ENDPOINT" != "null" ]; then
+    
+    # La URL directa de un objeto en MinIO es: http://endpoint:port/bucket_name/object_path
+    local MINIO_BASE_URL="${MINIO_PULL_ENDPOINT}" # O https si MinIO usa SSL
+    # local MINIO_BASE_URL="${MINIO_PULL_ENDPOINT}:${MINIO_PULL_PORT}" # O https si MinIO usa SSL
+    local MINIO_TAR_URL="${MINIO_BASE_URL}/${MINIO_BUCKET}/${LOCAL_IMAGE_TAR_FILENAME}" # MinIO usa path-style para objetos
+    local MINIO_JSON_URL="${MINIO_BASE_URL}/${MINIO_BUCKET}/${LOCAL_IMAGE_JSON_FILENAME}" # Los objetos se guardan con el nombre de archivo
+    echo $MINIO_TAR_URL
+    echo "Intentando descargar desde MinIO: $MINIO_TAR_URL"
+    wget -O "$LOCAL_TAR_PATH" "$MINIO_TAR_URL"
     if [ $? -eq 0 ]; then
-      echo "¡Descarga completada con éxito! Imagen guardada en: $IMAGE_PATH"
-      # --- Generar Metadatos para la imagen descargada ---
-      # Necesita cargar scripts/metadata.sh para usar generate_container_metadata.
-      # Esta lógica se ejecuta si pull.sh es llamado directamente o si run.sh lo llama.
-      local METADATA_SCRIPT_PULL_PULL="$SCRIPT_DIR/metadata.sh" # Corregido: Variable distinta
-      if [ -f "$METADATA_SCRIPT_PULL" ]; then
-        . "$METADATA_SCRIPT_PULL" # Carga metadata.sh si pull.sh se ejecuta directamente.
-        if ! command_exists generate_container_metadata; then # Usa command_exists de utils.sh
-          echo "Advertencia: generate_container_metadata no disponible en pull.sh. Metadatos de descarga no generados." >&2
+      echo "Imagen TAR descargada de MinIO."
+      wget -O "$LOCAL_JSON_PATH" "$MINIO_JSON_URL" # Intentar descargar JSON
+      if [ $? -ne 0 ]; then
+        echo "Advertencia: Metadatos JSON no encontrados en MinIO para '${distribution_name_arg}:${image_version_arg}'. Se generarán metadatos básicos." >&2
+        
+        local REPO_TAG_FOR_META="[\"${distribution_name_arg}:${image_version_arg}\"]"
+        local IMAGE_ID_FOR_META="$(md5sum "$LOCAL_TAR_PATH" | awk '{print $1}' 2>/dev/null)"
+        if [ -z "$IMAGE_ID_FOR_META" ]; then IMAGE_ID_FOR_META="unknown_id"; fi # Fallback
+
+        generate_image_metadata \
+          "$IMAGE_ID_FOR_META" \
+          "$REPO_TAG_FOR_META" \
+          "$LOCAL_TAR_PATH" \
+          "unknown" \
+          "null" "/root" "[]" # Default values for CMD, WorkDir, ENV
+        
+        if [ $? -ne 0 ]; then
+            echo "ERROR: generate_image_metadata falló al generar metadatos básicos después de descarga desde MinIO." >&2
+            rm -f "$LOCAL_JSON_PATH"
         else
-          local REPO_TAG_FOR_META="${distribution_name_arg}:${image_version_arg}"
-          # No tenemos el rootfs para el VirtualSize aquí, lo dejamos como "unknown".
-          # No tenemos el Cmd para la imagen descargada, será "null".
-          # Mounts y Env también serán null/empty.
-          generate_container_metadata \
-            "$distribution_name_arg-$image_version_arg" \
-            "$REPO_TAG_FOR_META" \
-            "$distribution_name_arg" \
-            "$image_version_arg" \
-            "$IMAGE_PATH" \
-            "unknown" \
-            "false" "false" \
-            "null" "[]" "[]" # Valores predeterminados para el JSON
-          echo "Metadatos de la imagen descargada guardados en: $IMAGE_METADATA_FILE"
+            echo "Metadatos básicos generados para la imagen descargada."
         fi
-      else
-        echo "Advertencia: metadata.sh no encontrado en '$METADATA_SCRIPT_PULL'. No se generarán metadatos para la imagen descargada." >&2
       fi
-      # --- Fin de Generación de Metadatos ---
+      echo "--- Descarga completada desde MinIO ---"
+      DOWNLOAD_FINAL_STATUS=0 # Éxito desde MinIO
     else
-      echo "Error: Falló la descarga de la imagen de ${distribution_name_arg^}. Asegúrate de que la versión '$image_version_arg' exista para la arquitectura '$download_arch' y que la URL '$DOWNLOAD_URL' sea correcta."
-      return 1
+      echo "No se encontró la imagen en MinIO. Intentando fuentes oficiales..."
     fi
   fi
 
-  echo "--- Proceso de descarga finalizado ---"
-  return 0 
+  # --- Descargar desde fuentes oficiales (si la descarga desde MinIO no fue exitosa) ---
+  if [ "$DOWNLOAD_FINAL_STATUS" -ne 0 ]; then # Solo si la descarga remota/MinIO no tuvo éxito
+    local OFFICIAL_DOWNLOAD_URL=""
+    case "$distribution_name_arg" in
+      alpine)
+        local ALPINE_MAJOR_MINOR=$(echo "$image_version_arg" | cut -d'.' -f1-2)
+        local ALPINE_ARCH_FOR_URL="aarch64"
+        if [ "$download_arch" == "arm64" ]; then ALPINE_ARCH_FOR_URL="aarch64"; elif [ "$download_arch" == "amd64" ]; then ALPINE_ARCH_FOR_URL="x86_64"; elif [ "$download_arch" == "armhf" ]; then ALPINE_ARCH_FOR_URL="armhf"; else echo "Error: Arch '$download_arch' no compatible con Alpine."; return 1; fi
+        OFFICIAL_DOWNLOAD_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_MAJOR_MINOR}/releases/${ALPINE_ARCH_FOR_URL}/alpine-minirootfs-${image_version_arg}-${ALPINE_ARCH_FOR_URL}.tar.gz"
+        ;;
+      ubuntu)
+        local UBUNTU_ARCH_FOR_URL=""
+        if [ "$download_arch" == "arm64" ]; then UBUNTU_ARCH_FOR_URL="arm64"; elif [ "$download_arch" == "amd64" ]; then UBUNTU_ARCH_FOR_URL="amd64"; elif [ "$download_arch" == "armhf" ]; then UBUNTU_ARCH_FOR_URL="armhf"; else echo "Error: Arch '$download_arch' no compatible con Ubuntu."; return 1; fi
+        OFFICIAL_DOWNLOAD_URL="http://cdimage.ubuntu.com/ubuntu-base/releases/${image_version_arg}/release/ubuntu-base-${image_version_arg}-base-${UBUNTU_ARCH_FOR_URL}.tar.gz"
+        ;;
+      *)
+        echo "Error interno: La distribución '$distribution_name_arg' no tiene una lógica de descarga definida." >&2
+        return 1
+        ;;
+    esac 
+
+    echo "Intentando descargar la imagen de ${distribution_name_arg^} (versión ${image_version_arg}, arquitectura ${download_arch}) desde fuentes oficiales..."
+    echo "URL de descarga: $OFFICIAL_DOWNLOAD_URL"
+
+    wget -O "$LOCAL_TAR_PATH" "$OFFICIAL_DOWNLOAD_URL"
+    if [ $? -eq 0 ]; then
+      echo "¡Descarga completada con éxito! Imagen guardada en: $LOCAL_TAR_PATH"
+      # Llamar a generate_image_metadata directamente (asumiendo que metadata.sh está cargado)
+      local REPO_TAG_FOR_META="[\"${distribution_name_arg}:${image_version_arg}\"]" # Array JSON
+      local IMAGE_ID_FOR_META="$(md5sum "$LOCAL_TAR_PATH" | awk '{print $1}' 2>/dev/null)"
+      if [ -z "$IMAGE_ID_FOR_META" ]; then IMAGE_ID_FOR_META="unknown_id"; fi # Fallback
+
+      generate_image_metadata \
+        "$IMAGE_ID_FOR_META" \
+        "$REPO_TAG_FOR_META" \
+        "$LOCAL_TAR_PATH" \
+        "unknown" \
+        "null" "/root" "[]" # Default values for CMD, WorkDir, ENV
+      echo "Metadatos de la imagen descargada guardados en: $LOCAL_JSON_PATH"
+      echo "--- Proceso de descarga finalizado ---"
+      DOWNLOAD_FINAL_STATUS=0 # Éxito desde oficial
+    else
+      echo "Error: Falló la descarga de la imagen de ${distribution_name_arg^}. Asegúrate de que la versión '$image_version_arg' exista para la arquitectura '$download_arch' y que la URL '$OFFICIAL_DOWNLOAD_URL' sea correcta." >&2
+      DOWNLOAD_FINAL_STATUS=1 # Fallo total
+    fi
+  fi
+
+  return "$DOWNLOAD_FINAL_STATUS" # Retorna el estado final
 }
 
-# --- Lógica de Ejecución Principal (si pull.sh se llama directamente) ---
+# Lógica principal si pull.sh se llama directamente
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main_pull_logic() {
       show_help() {
         echo "Uso: pull.sh <imagen>[:<version>]"
         echo ""
-        echo "Descarga una imagen de contenedor desde su fuente oficial."
+        echo "Descarga una imagen de contenedor desde su repositorio remoto o fuentes oficiales."
         echo "Si la versión no se especifica, se intenta descargar la última versión estable (solo para Alpine)."
         echo "Ejemplos:"
-        echo "  pull.sh alpine:3.22.0"
-        echo "  pull.sh alpine       (Descarga la última versión estable de Alpine)"
-        echo "  pull.sh ubuntu:22.04.3 (Descarga Ubuntu 22.04.3 LTS para tu arquitectura)"
+        echo "  ./proobox pull alpine:3.22.0"
+        echo "  ./proobox pull ubuntu:22.04.3"
+        echo "  ./proobox pull my_custom_image:latest" # Si estaba configurado el remoto.
       }
 
-      if [ -z "$1" ]; then
-        show_help
-        return 0
-      fi
+      if [ -z "$1" ]; then show_help; return 0; fi
 
-      local distribution_name_cli
-      local image_version_cli
-
-      IFS=':' read -r distribution_name_cli image_version_cli <<< "$1"
-
-      if [ -z "$distribution_name_cli" ]; then
-          echo "Error: Formato de imagen incorrecto. Use 'distribucion:version' o 'distribucion'."
-          show_help
-          return 1
-      fi
-
-      # Manejo de versiones: solo Alpine puede no especificar versión.
+      local distribution_name_cli=$(echo "$1" | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
+      local image_version_cli=$(echo "$1" | cut -d':' -f2)
       if [ -z "$image_version_cli" ] && [[ "$1" == *":"* ]]; then
-          echo "Error: Si usa ':', debe especificar una versión completa. Ej: ubuntu:22.04.3"
+          echo "Error: Si usa ':', debe especificar una versión completa. Ej: ubuntu:22.04.3" >&2
           show_help
           return 1
       fi
-      
-      if [ -z "$image_version_cli" ] && [[ "$1" != *":"* ]]; then
-          if [ "$distribution_name_cli" != "alpine" ]; then
-            echo "Error: La versión debe ser especificada para la distribución '$distribution_name_cli'. Ej: $distribution_name_cli:22.04.3"
-            show_help
-            return 1
-          fi
-          image_version_cli="" # Para Alpine, buscará la última.
-      fi
-
-      distribution_name_cli=$(echo "$distribution_name_cli" | tr '[:upper:]' '[:lower:]')
-
-      # Llamamos a la función download_image con los argumentos parseados de la CLI
-      case "$distribution_name_cli" in
-        alpine|ubuntu) # Ahora soporta Ubuntu
-          download_image "$distribution_name_cli" "$image_version_cli" "" # Pasa "" para que use la arch detectada
-          ;;
-        *)
-          echo "Error: Distribución '$distribution_name_cli' no soportada actualmente para descarga. Soportadas: alpine, ubuntu."
+      if [ -z "$image_version_cli" ] && [ "$distribution_name_cli" != "alpine" ]; then
+          echo "Error: La versión debe ser especificada para la distribución '$distribution_name_cli'. Ej: $distribution_name_cli:22.04.3" >&2
           show_help
           return 1
-          ;;
-      esac
+      fi
+      if [ -z "$image_version_cli" ] && [ "$distribution_name_cli" == "alpine" ]; then
+          image_version_cli="" # La función lo detectará.
+      fi
+
+      download_image "$distribution_name_cli" "$image_version_cli" "" # Pasa "" para que use la arch detectada
+      return $? # Retorna el código de salida de download_image
     }
-    main_pull_logic "$@" # Llama a la función si el script es ejecutado directamente.
+    main_pull_logic "$@"
 fi
