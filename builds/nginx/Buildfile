@@ -1,16 +1,12 @@
 FROM alpine:3.22.0
-# RUN apk update && apk add nginx
+RUN apk update && apk add nginx
 # RUN adduser -D -g 'www' www
 # RUN mkdir /www \
 #   chown -R www:www /var/lib/nginx\
 #   chown -R www:www /www
 
-COPY default.conf /tmp/default.conf
-RUN touch /tmp/test
-RUN ls /tmp
-# RUN ls /mnt/host_context_copy
+COPY default.conf /etc/nginx/http.d/default.conf
+RUN cat /etc/nginx/http.d/default.conf
 RUN mkdir -p /run/nginx
 
-# EXPOSE 8080
-# CMD ["/bin/sh", "-c", "nginx -g 'pid /tmp/nginx.pid;' && tail -f /dev/stdout"]
 CMD ["nginx", "-g", "daemon off; pid /tmp/nginx.pid;"]

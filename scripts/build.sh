@@ -264,8 +264,16 @@ main_build_logic() {
     IS_FROM_CACHED=true
     STEP_STATUS="CACHED"
   else
-    echo -n "$(get_current_time) => [1/${TOTAL_BUILD_STEPS}] FROM ${BASE_IMAGE_TAG} "
-    tar -xf "$base_image_tar_path" -C "$BUILD_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner || { echo "Error: Falló la descompresión de la imagen base."; rm -rf "$BUILD_DATA_DIR"; return 1; }
+    echo -e "$(get_current_time) => [1/${TOTAL_BUILD_STEPS}] FROM ${BASE_IMAGE_TAG} "
+    
+    tar -xf "$base_image_tar_path" -C "$BUILD_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner >/dev/null 2>&1
+
+    if [ "$(ls -AF "$BUILD_ROOTFS" | wc -l)" -le 0 ]; then
+      echo "?????"
+      echo "Error: Falló la descompresión de la imagen base."; 
+      /bin/rm -rf "$BUILD_DATA_DIR";
+      return 1; 
+    fi
     
     if [ "$NO_CACHE" = false ]; then
         cp -a "$BUILD_ROOTFS/." "$CACHE_FROM_PATH" || { echo "Advertencia: Falló el cacheo de la capa FROM."; }
@@ -322,8 +330,8 @@ main_build_logic() {
     local COMMAND_TYPE=$(echo "$line" | awk '{print $1}')
     local COMMAND_ARGS_RAW=$(echo "$line" | cut -d' ' -f2-) 
     
-    local DISPLAY_COMMAND_ARGS=$(echo "$COMMAND_ARGS_RAW" | head -c 20)
-    if [ "${#COMMAND_ARGS_RAW}" -gt 20 ]; then
+    local DISPLAY_COMMAND_ARGS=$(echo "$COMMAND_ARGS_RAW" | head -c 60)
+    if [ "${#COMMAND_ARGS_RAW}" -gt 60 ]; then
         DISPLAY_COMMAND_ARGS+="..."
     fi
 
@@ -483,15 +491,15 @@ main_build_logic() {
     # Solo incrementar el STEP_NUMBER_DISPLAY si no se saltó este paso.
     # El tiempo transcurrido se muestra después de cada paso.
     # Los mensajes de "Estableciendo WORKDIR" o "Comando predeterminado" ya no necesitan su propio 'echo -n'.
-    if [ "$SKIPPED_FROM_CACHE" = false ]; then
-        if [ "$COMMAND_TYPE" == "WORKDIR" ]; then
-            echo -e "Estableciendo WORKDIR: ${DISPLAY_COMMAND_ARGS} "
-        elif [ "$COMMAND_TYPE" == "CMD" ]; then
-            echo -e "Comando predeterminado (CMD) guardado: ${DISPLAY_COMMAND_ARGS} "
-        elif [ "$COMMAND_TYPE" == "ENV" ]; then
-            echo -e "Estableciendo variable de entorno: ${DISPLAY_COMMAND_ARGS} "
-        fi
-    fi
+    # if [ "$SKIPPED_FROM_CACHE" = false ]; then
+    #     if [ "$COMMAND_TYPE" == "WORKDIR" ]; then
+    #         echo -e "Estableciendo WORKDIR: ${DISPLAY_COMMAND_ARGS} "
+    #     elif [ "$COMMAND_TYPE" == "CMD" ]; then
+    #         echo -e "Comando predeterminado (CMD) guardado: ${DISPLAY_COMMAND_ARGS} "
+    #     elif [ "$COMMAND_TYPE" == "ENV" ]; then
+    #         echo -e "Estableciendo variable de entorno: ${DISPLAY_COMMAND_ARGS} "
+    #     fi
+    # fi
 
     local END_TIME_STEP=$(date +%s)
     local ELAPSED_TIME_FORMATTED=$(format_elapsed_time $START_TIME_STEP $END_TIME_STEP)
@@ -524,13 +532,16 @@ main_build_logic() {
   # Mostrando la línea final de exportación como Docker
   echo -n "$(get_current_time) => exporting to image "
   local EXPORT_START_TIME=$(date +%s)
-  tar -czf "$NEW_IMAGE_PATH" \
+  echo "---------- $NEW_IMAGE_PATH"
+    
+  sh -c "/bin/tar -czf "$NEW_IMAGE_PATH" \
       --exclude='dev/*' \
       --exclude='proc/*' \
       --exclude='sys/*' \
       --exclude='tmp/*' \
       --exclude='run/*' \
-      -C "$BUILD_ROOTFS" . || { echo "Error: Falló al crear la imagen TAR.GZ."; rm -rf "$BUILD_DATA_DIR"; return 1; }
+      -C "$BUILD_ROOTFS" ." || { echo "Error: Falló al crear la imagen TAR.GZ."; rm -rf "$BUILD_DATA_DIR"; return 1; }
+  
   local EXPORT_END_TIME=$(date +%s)
   local EXPORT_ELAPSED_TIME=$(format_elapsed_time $EXPORT_START_TIME $EXPORT_END_TIME)
   echo " (${EXPORT_ELAPSED_TIME})"
@@ -543,7 +554,9 @@ main_build_logic() {
 
   local FINAL_CMD_JSON_FOR_METADATA_CLEAN="null"
   if command_exists jq; then
+      echo  " {{{{{{{{$FINAL_CMD_ARGS_JSON" 
       if echo "$FINAL_CMD_ARGS_JSON" | jq -e 'if type == "array" then . else empty end' >/dev/null 2>&1; then
+
           FINAL_CMD_JSON_FOR_METADATA_CLEAN="$FINAL_CMD_ARGS_JSON"
       fi
   else

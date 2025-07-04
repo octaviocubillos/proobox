@@ -228,7 +228,6 @@ main_run_logic() {
 
   else
     IMAGE_ACTUAL_COMPRESSED_PATH="$DOWNLOAD_IMAGES_DIR/$local_compressed_image_filename"
-    echo "Imagen comprimida '${IMAGE_TAG}' encontrada localmente en: $IMAGE_ACTUAL_COMPRESSED_PATH"
   fi
 
   if [ ! -f "$IMAGE_ACTUAL_COMPRESSED_PATH" ]; then
@@ -240,7 +239,6 @@ main_run_logic() {
   # 1. Preparar el directorio del contenedor y el rootfs
   if [ -z "$CONTAINER_NAME" ]; then
     CONTAINER_NAME="${parsed_distribution_name}-$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)"
-    echo "Generando nombre de contenedor: $CONTAINER_NAME"
   fi
 
   local CONTAINER_ROOTFS="$CONTAINERS_DIR/$CONTAINER_NAME/rootfs" # El directorio raíz del sistema de archivos del contenedor.
@@ -255,18 +253,15 @@ main_run_logic() {
   if [ -d "$CONTAINER_ROOTFS" ]; then
     echo "Advertencia: El contenedor '$CONTAINER_NAME' ya existe. Reutilizando el existente."
   else
-    echo "Creando directorio para el contenedor: $CONTAINER_DATA_DIR"
     mkdir -p "$CONTAINER_DATA_DIR" || { echo "Error: No se pudo crear el directorio del contenedor."; return 1; }
     mkdir -p "$CONTAINER_ROOTFS" # Asegurarse que el destino existe.
 
     if [ -d "$IMAGE_CACHE_PATH" ] && [ -n "$(ls -A "$IMAGE_CACHE_PATH" 2>/dev/null)" ]; then
-      echo "Usando imagen cacheadada para '${IMAGE_TAG}' desde '$IMAGE_CACHE_PATH'..."
-      # Copia los archivos del cache al rootfs del nuevo contenedor.
       cp -a "$IMAGE_CACHE_PATH/." "$CONTAINER_ROOTFS" || { echo "Error: Falló la copia desde el cache de imágenes."; rm -rf "$CONTAINER_DATA_DIR"; return 1; }
     else
       echo "Cache de imagen descomprimida no encontrada. Descomprimiendo '${IMAGE_TAG}' en '$CONTAINER_ROOTFS'..."
       
-      tar -xf "$IMAGE_ACTUAL_COMPRESSED_PATH" -C "$CONTAINER_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner || { echo "Error: Falló la descompresión de la imagen .tar.gz."; rm -rf "$CONTAINER_DATA_DIR"; return 1; }
+      /bin/tar -xf "$IMAGE_ACTUAL_COMPRESSED_PATH" -C "$CONTAINER_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner || { echo "Error: Falló la descompresión de la imagen .tar.gz."; rm -rf "$CONTAINER_DATA_DIR"; return 1; }
       
       echo "Guardando imagen descomprimida en cache para futuros usos: '$IMAGE_CACHE_PATH'"
       cp -a "$CONTAINER_ROOTFS/." "$IMAGE_CACHE_PATH" || { echo "Advertencia: Falló el cacheo de la imagen descomprimida. No afectará la ejecución actual."; }
@@ -282,26 +277,24 @@ main_run_logic() {
   mkdir -p "$CONTAINER_ROOTFS/tmp" 2>/dev/null; chmod 1777 "$CONTAINER_ROOTFS/tmp"
   mkdir -p "$CONTAINER_ROOTFS/run" 2>/dev/null; chmod 755 "$CONTAINER_ROOTFS/run"
 
-  # --- Configurar DNS (se mueve aquí para asegurar que el directorio /etc exista si es necesario) ---
   mkdir -p "$CONTAINER_ROOTFS/etc" # Asegurar que /etc exista
   echo "nameserver 8.8.8.8" > "$CONTAINER_ROOTFS/etc/resolv.conf"
   echo "nameserver 8.8.4.4" >> "$CONTAINER_ROOTFS/etc/resolv.conf"
-  echo "DNS configurado con servidores de Google."
-  echo "Entorno básico configurado."
-  # --- FIN NUEVO BLOQUE ---
 
   # --- Determinar el COMANDO FINAL a ejecutar (CLI sobre escribe CMD de la imagen) ---
   local PROOT_EXEC_SHELL_PATH="" 
   local IMAGE_CMD_FROM_METADATA_JSON="null" # Valor por defecto (string JSON)
-   local IMAGE_WORKDIR_FROM_METADATA="/root" # Valor por defecto seguro.
+  local IMAGE_WORKDIR_FROM_METADATA="/root" # Valor por defecto seguro.
+  local IMAGE_ENV_FROM_METADATA_JSON="null" # Valor por defecto (string JSON)
   if [ -f "$IMAGE_METADATA_FILE" ]; then
       IMAGE_CMD_FROM_METADATA_JSON=$(jq -c '.ContainerConfig.Cmd' "$IMAGE_METADATA_FILE" 2>/dev/null)
       local raw_workdir_from_json=$(jq -r '.ContainerConfig.WorkingDir' "$IMAGE_METADATA_FILE" 2>/dev/null)
-      
-      # Si jq devuelve "null" (como string) O si la cadena está vacía, mantener el valor por defecto "/root".
-      # De lo contrario, usar el valor de los metadatos.
       if [ "$raw_workdir_from_json" != "null" ] && [ -n "$raw_workdir_from_json" ]; then
           IMAGE_WORKDIR_FROM_METADATA="$raw_workdir_from_json"
+      fi
+      local raw_env_from_json=$(jq -c '.ContainerConfig.Env' "$IMAGE_METADATA_FILE" 2>/dev/null)
+      if [ "$raw_env_from_json" != "null" ] && [ -n "$raw_env_from_json" ]; then
+          IMAGE_ENV_FROM_METADATA_JSON="$raw_env_from_json"
       fi
   fi
 
@@ -309,14 +302,12 @@ main_run_logic() {
   local FINAL_COMMAND_TO_EXECUTE=() 
   if [ ${#COMMAND_TO_RUN_CLI[@]} -eq 0 ]; then # Si no hay comando CLI, usar el CMD de la imagen.
       if [ "$IMAGE_CMD_FROM_METADATA_JSON" != "null" ] && [ "$IMAGE_CMD_FROM_METADATA_JSON" != "[]" ]; then
-          echo "No se especificó comando en 'run'. Usando CMD de la imagen: '$IMAGE_CMD_FROM_METADATA_JSON'"
           # Convertir el string JSON del CMD de la imagen a un array Bash.
           while IFS= read -r cmd_item; do
               FINAL_COMMAND_TO_EXECUTE+=("$cmd_item")
           done < <(echo "$IMAGE_CMD_FROM_METADATA_JSON" | jq -r '.[]')
           command_json_string="[\"${FINAL_COMMAND_TO_EXECUTE[@]}\"]" # Para metadatos, el comando final
       else
-          echo "No se especificó comando en 'run' y la imagen no tiene CMD. Usando shell por defecto."
           if [ "$parsed_distribution_name" == "alpine" ]; then PROOT_EXEC_SHELL_PATH="/bin/sh"; fi
           if [ "$parsed_distribution_name" == "ubuntu" ]; then PROOT_EXEC_SHELL_PATH="/bin/bash"; fi
           if $INTERACTIVE_TTY; then
@@ -436,6 +427,9 @@ main_run_logic() {
     "TERM=$TERM" 
     "LANG=C.UTF-8"
   )
+  for env_var in $(echo "$IMAGE_ENV_FROM_METADATA_JSON" | jq -r '.[]'); do
+      PROOT_COMMAND_ARRAY+=("$env_var")
+  done
 
   # Añadir variables de entorno personalizadas (acumuladas)
   for env_var in "${ENVIRONMENT_VARS[@]}"; do
@@ -446,7 +440,6 @@ main_run_logic() {
   PROOT_COMMAND_ARRAY+=("${FINAL_COMMAND_TO_EXECUTE[@]}")
 
   # --- Ejecutar el contenedor ---
-  echo "Starting container '$CONTAINER_NAME'..."
   local LOG_FILE="$CONTAINER_DATA_DIR/container.log"
 
   if $DETACHED_MODE; then
@@ -458,10 +451,8 @@ main_run_logic() {
     echo "Para ver la salida, revisa: $LOG_FILE"
     update_container_state_metadata "$CONTAINER_NAME" "running" "true" "null"
   else # Interactive or attached mode
-    echo "Entrando al contenedor '$CONTAINER_NAME'..."
     "${PROOT_COMMAND_ARRAY[@]}"
     local EXIT_CODE=$? 
-    echo "Contenedor '$CONTAINER_NAME' terminado. Código de salida: $EXIT_CODE"
     update_container_state_metadata "$CONTAINER_NAME" "exited" "false" "$EXIT_CODE"
   fi
 

@@ -5,17 +5,23 @@
 # --- Variables de Configuración Global ---
 CONTAINERS_DIR="$HOME/.proobox/containers"
 
-# --- Funciones de Utilidad ---
-command_exists () {
-  command -v "$1" >/dev/null 2>&1
-}
+# --- Cargar scripts de utilidad ---
+SCRIPT_DIR="$(cd "$(/bin/dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+UTILS_SCRIPT="$SCRIPT_DIR/utils.sh" # Ruta al script de utilidades.
+
+if [ -f "$UTILS_SCRIPT" ]; then
+  . "$UTILS_SCRIPT"
+else
+  echo "Error: No se encontró el script de utilidades '$UTILS_SCRIPT'. Funcionalidad limitada." >&2
+  exit 1
+fi
 
 # Determina si un proceso proot está en ejecución para un contenedor dado.
 # Reutiliza la lógica de ps.sh para mantener la consistencia.
 is_running() {
     local container_name="$1"
-    local rootfs_path_escaped=$(echo "$CONTAINERS_DIR/$container_name/rootfs" | sed 's/\//\\\//g')
-    if pgrep -f "proot.*-r $rootfs_path_escaped" >/dev/null; then
+    local rootfs_path_escaped=$(echo "$CONTAINERS_DIR/$container_name/rootfs" | /bin/sed 's/\//\\\//g')
+    if /bin/pgrep -f "proot.*-r $rootfs_path_escaped" >/dev/null; then
         echo "Running"
     else
         echo "Exited"
@@ -99,20 +105,18 @@ main_rm_logic() {
     local container_name=$(basename "$container_found_path")
     local container_status=$(is_running "$container_name")
 
-    echo "Intentando eliminar contenedor: '$container_name' (ID corto: ${container_name:0:12})"
-
     if [ "$container_status" == "Running" ]; then
       if $FORCE_REMOVE; then
         echo "Contenedor '$container_name' está en ejecución. Forzando detención..."
-        local proot_pids=$(pgrep -f "proot.*-r $(echo "$CONTAINERS_DIR/$container_name/rootfs" | sed 's/\//\\\//g')")
+        local proot_pids=$(/bin/pgrep -f "proot.*-r $(echo "$CONTAINERS_DIR/$container_name/rootfs" | /bin/sed 's/\//\\\//g')")
         if [ -n "$proot_pids" ]; then
             echo "Matando procesos proot asociados (PIDs: $proot_pids)..."
             kill $proot_pids 2>/dev/null
             sleep 1 
-            if pgrep -f "proot.*-r $(echo "$CONTAINERS_DIR/$container_name/rootfs" | sed 's/\//\\\//g')" >/dev/null; then
+            if /bin/pgrep -f "proot.*-r $(echo "$CONTAINERS_DIR/$container_name/rootfs" | sed 's/\//\\\//g')" >/dev/null; then
                 echo "Advertencia: Algunos procesos proot no terminaron. Intentando kill -9."
                 kill -9 $proot_pids 2>/dev/null
-                sleep 1
+                /bin/sleep 1
             fi
         fi
         local container_status_after_kill=$(is_running "$container_name")
@@ -129,11 +133,8 @@ main_rm_logic() {
     fi
 
     # Eliminar el directorio del contenedor
-    echo "Eliminando directorio del contenedor: '$container_found_path'..."
-    rm -rf "$container_found_path"
-    if [ $? -eq 0 ]; then
-      echo "Contenedor '$container_name' eliminado correctamente."
-    else
+    /bin/rm -rf "$container_found_path"
+    if [ $? -ne 0 ]; then
       echo "Error: Falló la eliminación del directorio del contenedor '$container_name'."
     fi
 

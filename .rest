@@ -1,8 +1,0 @@
-@endpoint=http://192.168.100.201:5000
-
-###
-GET {{endpoint}}/v2
-
-###
-GET {{endpoint}}/v2
-Authorization: Basic dHVfdXN1YXJpbzpsYS1jbGF2ZQ==

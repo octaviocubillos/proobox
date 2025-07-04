@@ -7,4 +7,8 @@ command_exists () {
   command -v "$1" >/dev/null 2>&1
 }
 
+basename () {
+  /bin/basename "$@"
+}
+
 # Puedes añadir otras funciones de utilidad aquí en el futuro.
