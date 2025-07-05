@@ -1,14 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Este script se encarga de descargar imágenes oficiales de distribuciones.
-# Funciona como una librería de funciones si es 'sourced', o como un script independiente si se llama directamente.
+# Este script se encarga de descargar imágenes oficiales de distribuciones o desde un repositorio SFTP via backend HTTP.
 
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 UTILS_SCRIPT="$SCRIPT_DIR/utils.sh"
 METADATA_SCRIPT_PULL="$SCRIPT_DIR/metadata.sh"
 
-# Cargar utilidades. command_exists estará disponible.
 if [ -f "$UTILS_SCRIPT" ]; then
   . "$UTILS_SCRIPT"
 else
@@ -16,7 +14,6 @@ else
   exit 1
 fi
 
-# Cargar metadata.sh. Confía en que sus funciones (como generate_image_metadata) estarán disponibles.
 if [ -f "$METADATA_SCRIPT_PULL" ]; then
   . "$METADATA_SCRIPT_PULL"
 else
@@ -26,15 +23,15 @@ fi
 
 
 # --- Variables de Configuración Global ---
-DOWNLOAD_BASE_DIR="$HOME/.proobox" # Base dir for all PRooBox data
-DOWNLOAD_IMAGES_DIR="$DOWNLOAD_BASE_DIR/images" # Directory to store downloaded images
-REPO_CONFIG_FILE="$PROOBOX_BASE_DIR/config.json" # Ruta al archivo de configuración del repo
+DOWNLOAD_BASE_DIR="$HOME/.proobox"
+DOWNLOAD_IMAGES_DIR="$DOWNLOAD_BASE_DIR/images"
+REPO_CONFIG_FILE="$PROOBOX_BASE_DIR/config.json"
 
 
 # --- Funciones de Descarga de Imágenes ---
 
 # Determina y mapea la arquitectura del sistema.
-get_mapped_architecture() { 
+get_mapped_architecture() {
   local termux_arch=$(dpkg --print-architecture)
   case "$termux_arch" in
     aarch64) echo "arm64";;
@@ -63,40 +60,25 @@ get_latest_alpine_version() {
 }
 
 # Función para normalizar la cadena de versión (ej. "1" -> "1.0.0", "2.5" -> "2.5.0").
-# Esto es una copia de la función de utils.sh para asegurar que pull.sh la tenga disponible.
 normalize_image_version() {
   local version_str="$1"
-  if [ -z "$version_str" ]; then
-      echo ""
-      return
-  fi
-
-  if [[ "$version_str" =~ ^[0-9]+$ ]]; then # Si es solo un número entero
-      echo "${version_str}.0.0"
-      return
-  fi
-  
-  if [[ "$version_str" =~ ^[0-9]+\.[0-9]+$ ]]; then # Si es X.Y
-      echo "${version_str}.0"
-      return
-  fi
-  
-  echo "$version_str" # Retorna la cadena original si no coincide con los patrones
+  if [ -z "$version_str" ]; then echo ""; return; fi
+  if [[ "$version_str" =~ ^[0-9]+$ ]]; then echo "${version_str}.0.0"; return; fi
+  if [[ "$version_str" =~ ^[0-9]+\.[0-9]+$ ]]; then echo "${version_str}.0"; return; fi
+  echo "$version_str"
 }
 
 # Función principal para descargar imágenes.
 # Retorna 0 si la descarga fue exitosa, 1 si falló.
 download_image() {
-  local distribution_name_arg="$1" 
-  local image_version_arg="$2"     
-  local target_arch_arg="$3"       
+  local distribution_name_arg="$1"
+  local image_version_arg="$2"
+  local target_arch_arg="$3"
 
-  # Asegurarse de que el nombre de la distribución siempre esté en minúsculas.
   distribution_name_arg=$(echo "$distribution_name_arg" | tr '[:upper:]' '[:lower:]')
 
   echo "--- Descargando Imagen ${distribution_name_arg^} ---"
 
-  # Normalizar la versión y manejar la lógica de "latest" o versión predeterminada.
   if [ -z "$image_version_arg" ]; then
     if [ "$distribution_name_arg" == "alpine" ]; then
       image_version_arg=$(get_latest_alpine_version)
@@ -113,7 +95,6 @@ download_image() {
     fi
   fi
 
-  # Normalizar la cadena de versión (ej. "1" -> "1.0.0", "2.5" -> "2.5.0")
   local normalized_image_version="$image_version_arg"
   if [[ "$normalized_image_version" =~ ^[0-9]+$ ]]; then
       normalized_image_version="${normalized_image_version}.0.0"
@@ -125,7 +106,7 @@ download_image() {
 
   local current_host_arch=$(get_mapped_architecture)
   if [ $? -ne 0 ]; then echo "$current_host_arch"; return 1; fi
-  local download_arch="${target_arch_arg:-$current_host_arch}" 
+  local download_arch="${target_arch_arg:-$current_host_arch}"
   echo "Arquitectura detectada para descarga: $download_arch"
 
   if ! command_exists wget; then
@@ -139,7 +120,6 @@ download_image() {
   local LOCAL_TAR_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_TAR_FILENAME"
   local LOCAL_JSON_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_JSON_FILENAME"
 
-  # Crear directorio de imágenes si no existe
   mkdir -p "$DOWNLOAD_IMAGES_DIR"
 
   # Si la imagen ya existe localmente (TAR y JSON válidos), saltar la descarga.
@@ -150,61 +130,47 @@ download_image() {
 
   local DOWNLOAD_FINAL_STATUS=1 # 0 para éxito, 1 para fallo
 
-  # --- OBTENER CONFIGURACIÓN DE MINIO PARA PULL ---
-  local MINIO_PULL_ENDPOINT=""
-  local MINIO_PULL_PORT=""
-  local MINIO_BUCKET="proobox-images" # El mismo bucket de push.sh
-
+  # --- OBTENER CONFIGURACIÓN DEL BACKEND PARA PULL ---
+  local BACKEND_URL=""
   if [ -f "$REPO_CONFIG_FILE" ]; then
-      MINIO_PULL_ENDPOINT=$(jq -r '.minio.endpoint' "$REPO_CONFIG_FILE" 2>/dev/null)
-      MINIO_PULL_PORT=$(jq -r '.minio.port' "$REPO_CONFIG_FILE" 2>/dev/null)
+      BACKEND_URL=$(jq -r '.backend.url' "$REPO_CONFIG_FILE" 2>/dev/null)
   fi
 
-  # --- Intentar descargar desde MinIO (si configurado y válido) ---
-  if [ -n "$MINIO_PULL_ENDPOINT" ] && \
-     [ "$MINIO_PULL_ENDPOINT" != "null" ]; then
-    
-    # La URL directa de un objeto en MinIO es: http://endpoint:port/bucket_name/object_path
-    local MINIO_BASE_URL="${MINIO_PULL_ENDPOINT}" # O https si MinIO usa SSL
-    # local MINIO_BASE_URL="${MINIO_PULL_ENDPOINT}:${MINIO_PULL_PORT}" # O https si MinIO usa SSL
-    local MINIO_TAR_URL="${MINIO_BASE_URL}/${MINIO_BUCKET}/${LOCAL_IMAGE_TAR_FILENAME}" # MinIO usa path-style para objetos
-    local MINIO_JSON_URL="${MINIO_BASE_URL}/${MINIO_BUCKET}/${LOCAL_IMAGE_JSON_FILENAME}" # Los objetos se guardan con el nombre de archivo
-    echo $MINIO_TAR_URL
-    echo "Intentando descargar desde MinIO: $MINIO_TAR_URL"
-    wget -O "$LOCAL_TAR_PATH" "$MINIO_TAR_URL"
+  # --- Intentar descargar desde el Backend (SFTP vía HTTP) ---
+  if [ -n "$BACKEND_URL" ] && [ "$BACKEND_URL" != "null" ]; then
+    # Construir la ruta del objeto en el servidor SFTP (ej: "alpine/alpine-3.22.0.tar.gz")
+    local SFTP_OBJECT_TAR_PATH="${distribution_name_arg}/${LOCAL_IMAGE_TAR_FILENAME}"
+    local SFTP_OBJECT_JSON_PATH="${distribution_name_arg}/${LOCAL_IMAGE_JSON_FILENAME}"
+
+    # Construir la URL de descarga del backend
+    local DOWNLOAD_BACKEND_URL_TAR="${BACKEND_URL}/images/download/${SFTP_OBJECT_TAR_PATH}"
+    local DOWNLOAD_BACKEND_URL_JSON="${BACKEND_URL}/images/download/${SFTP_OBJECT_JSON_PATH}"
+
+    echo "Intentando descargar de backend SFTP: $DOWNLOAD_BACKEND_URL_TAR"
+    wget -O "$LOCAL_TAR_PATH" "$DOWNLOAD_BACKEND_URL_TAR"
     if [ $? -eq 0 ]; then
-      echo "Imagen TAR descargada de MinIO."
-      wget -O "$LOCAL_JSON_PATH" "$MINIO_JSON_URL" # Intentar descargar JSON
+      echo "Imagen TAR descargada de backend SFTP."
+      wget -O "$LOCAL_JSON_PATH" "$DOWNLOAD_BACKEND_URL_JSON" # Intentar descargar JSON
       if [ $? -ne 0 ]; then
-        echo "Advertencia: Metadatos JSON no encontrados en MinIO para '${distribution_name_arg}:${image_version_arg}'. Se generarán metadatos básicos." >&2
-        
+        echo "Advertencia: Metadatos JSON no encontrados o falló descarga de backend SFTP. Se generarán metadatos básicos." >&2
         local REPO_TAG_FOR_META="[\"${distribution_name_arg}:${image_version_arg}\"]"
         local IMAGE_ID_FOR_META="$(md5sum "$LOCAL_TAR_PATH" | awk '{print $1}' 2>/dev/null)"
         if [ -z "$IMAGE_ID_FOR_META" ]; then IMAGE_ID_FOR_META="unknown_id"; fi # Fallback
-
         generate_image_metadata \
-          "$IMAGE_ID_FOR_META" \
-          "$REPO_TAG_FOR_META" \
-          "$LOCAL_TAR_PATH" \
-          "unknown" \
-          "null" "/root" "[]" # Default values for CMD, WorkDir, ENV
-        
-        if [ $? -ne 0 ]; then
-            echo "ERROR: generate_image_metadata falló al generar metadatos básicos después de descarga desde MinIO." >&2
-            rm -f "$LOCAL_JSON_PATH"
-        else
-            echo "Metadatos básicos generados para la imagen descargada."
-        fi
+          "$IMAGE_ID_FOR_META" "$REPO_TAG_FOR_META" "$LOCAL_TAR_PATH" "unknown" "null" "/root" "[]"
+        if [ $? -ne 0 ]; then echo "ERROR: generate_image_metadata falló al generar metadatos básicos después de descarga de backend SFTP." >&2; rm -f "$LOCAL_JSON_PATH"; fi
+      else
+        echo "Metadatos JSON descargados de backend SFTP."
       fi
-      echo "--- Descarga completada desde MinIO ---"
-      DOWNLOAD_FINAL_STATUS=0 # Éxito desde MinIO
+      echo "--- Descarga completada desde backend SFTP ---"
+      DOWNLOAD_FINAL_STATUS=0 # Éxito desde backend SFTP
     else
-      echo "No se encontró la imagen en MinIO. Intentando fuentes oficiales..."
+      echo "No se pudo descargar la imagen TAR.GZ de backend SFTP. Intentando fuentes oficiales..."
     fi
   fi
 
-  # --- Descargar desde fuentes oficiales (si la descarga desde MinIO no fue exitosa) ---
-  if [ "$DOWNLOAD_FINAL_STATUS" -ne 0 ]; then # Solo si la descarga remota/MinIO no tuvo éxito
+  # --- Descargar desde fuentes oficiales (si la descarga desde backend no fue exitosa) ---
+  if [ "$DOWNLOAD_FINAL_STATUS" -ne 0 ]; then # Solo si la descarga remota/MinIO/SFTP no tuvo éxito
     local OFFICIAL_DOWNLOAD_URL=""
     case "$distribution_name_arg" in
       alpine)
@@ -230,7 +196,6 @@ download_image() {
     wget -O "$LOCAL_TAR_PATH" "$OFFICIAL_DOWNLOAD_URL"
     if [ $? -eq 0 ]; then
       echo "¡Descarga completada con éxito! Imagen guardada en: $LOCAL_TAR_PATH"
-      # Llamar a generate_image_metadata directamente (asumiendo que metadata.sh está cargado)
       local REPO_TAG_FOR_META="[\"${distribution_name_arg}:${image_version_arg}\"]" # Array JSON
       local IMAGE_ID_FOR_META="$(md5sum "$LOCAL_TAR_PATH" | awk '{print $1}' 2>/dev/null)"
       if [ -z "$IMAGE_ID_FOR_META" ]; then IMAGE_ID_FOR_META="unknown_id"; fi # Fallback

@@ -258,12 +258,9 @@ main_run_logic() {
 
     if [ -d "$IMAGE_CACHE_PATH" ] && [ -n "$(ls -A "$IMAGE_CACHE_PATH" 2>/dev/null)" ]; then
       cp -a "$IMAGE_CACHE_PATH/." "$CONTAINER_ROOTFS" || { echo "Error: Falló la copia desde el cache de imágenes."; rm -rf "$CONTAINER_DATA_DIR"; return 1; }
-    else
-      echo "Cache de imagen descomprimida no encontrada. Descomprimiendo '${IMAGE_TAG}' en '$CONTAINER_ROOTFS'..."
-      
+    else      
       /bin/tar -xf "$IMAGE_ACTUAL_COMPRESSED_PATH" -C "$CONTAINER_ROOTFS" --exclude='dev/*' --exclude='proc/*' --exclude='sys/*' --no-same-owner || { echo "Error: Falló la descompresión de la imagen .tar.gz."; rm -rf "$CONTAINER_DATA_DIR"; return 1; }
       
-      echo "Guardando imagen descomprimida en cache para futuros usos: '$IMAGE_CACHE_PATH'"
       cp -a "$CONTAINER_ROOTFS/." "$IMAGE_CACHE_PATH" || { echo "Advertencia: Falló el cacheo de la imagen descomprimida. No afectará la ejecución actual."; }
     fi
   fi
@@ -443,12 +440,10 @@ main_run_logic() {
   local LOG_FILE="$CONTAINER_DATA_DIR/container.log"
 
   if $DETACHED_MODE; then
-    echo "Ejecutando en modo detached (segundo plano)."
     # Capturar PID después de lanzar.
     ( "${PROOT_COMMAND_ARRAY[@]}" > "$LOG_FILE" 2>&1 & )
     local PIDS_TEMP=$(pgrep -f "proot.*-r ${CONTAINER_ROOTFS//\//\\/}" | head -n 1) # Obtener PID de proot
-    echo "Contenedor '$CONTAINER_NAME' iniciado en segundo plano. PID: ${PIDS_TEMP:-?}"
-    echo "Para ver la salida, revisa: $LOG_FILE"
+    echo "$CONTAINER_NAME"
     update_container_state_metadata "$CONTAINER_NAME" "running" "true" "null"
   else # Interactive or attached mode
     "${PROOT_COMMAND_ARRAY[@]}"

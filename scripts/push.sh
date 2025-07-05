@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Este script sube una imagen local (.tar.gz y .json) a un repositorio MinIO usando el cliente 'mc'.
+# Este script sube una imagen local (.tar.gz y .json) a un repositorio SFTP via un backend HTTP.
 
 # --- Cargar scripts de utilidad ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -18,7 +18,6 @@ if [ ! -f "$METADATA_SCRIPT" ]; then
   echo "Error crítico: metadata.sh no encontrado en '$METADATA_SCRIPT'. No se pueden gestionar metadatos." >&2
   exit 1
 fi
-# Asegúrate de que las funciones de metadata.sh estén cargadas.
 . "$METADATA_SCRIPT"
 
 
@@ -26,7 +25,6 @@ fi
 PROOBOX_BASE_DIR="$HOME/.proobox"
 IMAGES_DIR="$PROOBOX_BASE_DIR/images"
 REPO_CONFIG_FILE="$PROOBOX_BASE_DIR/config.json" # Ruta al archivo de configuración del repo
-MINIO_ALIAS="proobox_minio" # Alias para el servidor MinIO en 'mc'
 
 
 # --- Lógica Principal del Script push.sh ---
@@ -36,9 +34,9 @@ main_push_logic() {
   show_push_help() {
     echo "Uso: push.sh <nombre_de_la_imagen>[:<etiqueta>]"
     echo ""
-    echo "Sube una imagen local (su .tar.gz y sus metadatos .json) a un repositorio MinIO."
-    echo "Configura el endpoint, puerto, usuario y contraseña de MinIO en: $REPO_CONFIG_FILE"
-    echo "Requiere el cliente 'mc' (MinIO Client) instalado."
+    echo "Sube una imagen local (su .tar.gz y sus metadatos .json) a un repositorio SFTP via un backend HTTP."
+    echo "Configura la URL del backend en: $REPO_CONFIG_FILE bajo 'backend.url'."
+    echo "Requiere el backend de Node.js/SFTP corriendo en el servidor."
     echo ""
     echo "Ejemplos:"
     echo "  ./proobox push my_custom_app:latest"
@@ -50,56 +48,27 @@ main_push_logic() {
     return 1
   fi
 
-  if ! command_exists mc; then
-    echo "Error: El cliente 'mc' (MinIO Client) no está instalado." >&2
-    echo "Por favor, instálalo siguiendo las instrucciones de MinIO (ej. 'pkg install mc' en Termux si está disponible, o descarga el binario)." >&2
+  if ! command_exists curl; then
+    echo "Error: 'curl' no está instalado. Por favor, instálalo con 'pkg install curl'." >&2
     return 1
   fi
 
-  # 1. Leer configuración de MinIO
+  # 1. Leer configuración del backend
   if [ ! -f "$REPO_CONFIG_FILE" ]; then
     echo "Error: Archivo de configuración del repositorio no encontrado: '$REPO_CONFIG_FILE'." >&2
-    echo "Por favor, crea este archivo con el formato JSON esperado para MinIO." >&2
+    echo "Por favor, crea este archivo con el formato JSON esperado (ej. para backend.url)." >&2
     return 1
   fi
 
-  local MINIO_ENDPOINT=$(jq -r '.minio.endpoint' "$REPO_CONFIG_FILE" 2>/dev/null)
-  local MINIO_PORT=$(jq -r '.minio.port' "$REPO_CONFIG_FILE" 2>/dev/null)
-  local MINIO_USERNAME=$(jq -r '.minio.username' "$REPO_CONFIG_FILE" 2>/dev/null)
-  local MINIO_PASSWORD=$(jq -r '.minio.password' "$REPO_CONFIG_FILE" 2>/dev/null)
-
-  if [ -z "$MINIO_ENDPOINT" ] || [ "$MINIO_ENDPOINT" == "null" ] || \
-     [ -z "$MINIO_PORT" ] || [ "$MINIO_PORT" == "null" ] || \
-     [ -z "$MINIO_USERNAME" ] || [ "$MINIO_USERNAME" == "null" ] || \
-     [ -z "$MINIO_PASSWORD" ] || [ "$MINIO_PASSWORD" == "null" ]; then
-    echo "Error: Configuración de MinIO incompleta o inválida en '$REPO_CONFIG_FILE'." >&2
-    echo "Asegúrate de que 'minio.endpoint', 'minio.port', 'minio.username' y 'minio.password' estén definidos." >&2
+  local BACKEND_URL=$(jq -r '.backend.url' "$REPO_CONFIG_FILE" 2>/dev/null) # URL del backend, ej: "http://192.168.100.201:3000"
+  if [ -z "$BACKEND_URL" ] || [ "$BACKEND_URL" == "null" ]; then
+    echo "Error: URL del backend no configurada en '$REPO_CONFIG_FILE' bajo 'backend.url'." >&2
     return 1
   fi
 
-  local MINIO_SERVER_URL="http://${MINIO_ENDPOINT}" # O https si tu MinIO usa SSL
-  local MINIO_BUCKET="proobox-images" # <-- Define el nombre del bucket donde guardarás las imágenes
+  echo "Backend configurado para SFTP: $BACKEND_URL"
 
-  echo "Repositorio MinIO configurado: $MINIO_SERVER_URL (Bucket: $MINIO_BUCKET)"
-
-  # 2. Configurar el alias de MinIO (si no existe o si las credenciales han cambiado)
-  # Esto añade o actualiza el alias en la configuración de mc (~/.mc/config.json)
-  echo "Configurando alias de MinIO: $MINIO_ALIAS"
-  mc alias set "$MINIO_ALIAS" "$MINIO_SERVER_URL" "$MINIO_USERNAME" "$MINIO_PASSWORD"
-  if [ $? -ne 0 ]; then
-    echo "Error: Falló la configuración del alias de MinIO. Verifica la URL y las credenciales." >&2
-    return 1
-  fi
-
-  # 3. Crear el bucket si no existe
-  echo "Verificando/Creando bucket: $MINIO_BUCKET"
-  mc mb "$MINIO_ALIAS/$MINIO_BUCKET" --ignore-existing
-  if [ $? -ne 0 ]; then
-    echo "Error: Falló la creación o verificación del bucket '$MINIO_BUCKET'. Verifica permisos." >&2
-    return 1
-  fi
-
-  # 4. Localizar archivos de imagen y metadatos
+  # 2. Localizar archivos de imagen y metadatos
   local parsed_dist_name=$(echo "$IMAGE_TAG_TO_PUSH" | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
   local parsed_image_version=$(echo "$IMAGE_TAG_TO_PUSH" | cut -d':' -f2)
   if [ -z "$parsed_image_version" ]; then parsed_image_version="latest"; fi
@@ -121,30 +90,38 @@ main_push_logic() {
     return 1
   fi
 
-  # 5. Subir archivos a MinIO
-  echo "--- Subiendo imagen '$IMAGE_TAG_TO_PUSH' a MinIO ---"
+  # 3. Subir archivos al backend (que los subirá a SFTP)
+  echo "--- Subiendo imagen '$IMAGE_TAG_TO_PUSH' al backend SFTP ---"
 
   local UPLOAD_SUCCESS=0
 
-  echo "Subiendo: $LOCAL_TAR_PATH a $MINIO_ALIAS/$MINIO_BUCKET/$IMAGE_TAR_FILENAME"
-  mc cp "$LOCAL_TAR_PATH" "$MINIO_ALIAS/$MINIO_BUCKET/$IMAGE_TAR_FILENAME"
-  
+  # Subir el archivo TAR.GZ
+  echo "Subiendo: $LOCAL_TAR_PATH al backend..."
+  # Usar -F para multipart/form-data, 'imageFile' debe coincidir con upload.single('imageFile') en el backend
+  curl -s -X POST \
+       -F "imageFile=@$LOCAL_TAR_PATH" \
+       "${BACKEND_URL}/images/upload" # Endpoint de subida
   if [ $? -ne 0 ]; then
-    echo "Error: Falló la subida del archivo TAR.GZ a MinIO." >&2
+    echo "Error: Falló la subida del archivo TAR.GZ al backend." >&2
     UPLOAD_SUCCESS=1
   fi
 
-  echo "Subiendo: $LOCAL_JSON_PATH a $MINIO_ALIAS/$MINIO_BUCKET/$IMAGE_JSON_FILENAME"
-  mc cp "$LOCAL_JSON_PATH" "$MINIO_ALIAS/$MINIO_BUCKET/$IMAGE_JSON_FILENAME"
-  if [ $? -ne 0 ]; then
-    echo "Error: Falló la subida del archivo JSON a MinIO." >&2
-    UPLOAD_SUCCESS=1
+  # Subir el archivo JSON
+  if [ "$UPLOAD_SUCCESS" -eq 0 ]; then
+      echo "Subiendo: $LOCAL_JSON_PATH al backend..."
+      curl -s -X POST \
+           -F "imageFile=@$LOCAL_JSON_PATH" \
+           "${BACKEND_URL}/images/upload" # Mismo endpoint de subida
+      if [ $? -ne 0 ]; then
+        echo "Error: Falló la subida del archivo JSON al backend." >&2
+        UPLOAD_SUCCESS=1
+      fi
   fi
 
   if [ "$UPLOAD_SUCCESS" -eq 0 ]; then
-    echo "¡Imagen '$IMAGE_TAG_TO_PUSH' subida con éxito a MinIO!"
+    echo "¡Imagen '$IMAGE_TAG_TO_PUSH' subida con éxito al repositorio SFTP (via backend)!"
   else
-    echo "Error: Falló la subida completa de la imagen a MinIO." >&2
+    echo "Error: Falló la subida completa de la imagen al repositorio SFTP." >&2
     return 1
   fi
 

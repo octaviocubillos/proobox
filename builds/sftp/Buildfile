@@ -1,0 +1,20 @@
+FROM alpine:3.22.0
+
+# Steps done in one RUN layer:
+# - Install upgrades and new packages
+# - OpenSSH needs /var/run/sshd to run
+# - Remove generic host keys, entrypoint generates unique keys
+RUN apk update && apk upgrade && \
+    apk add bash shadow openssh-server-pam openssh-sftp-server && \
+    rm -rf /var/cache/apk/* && \
+    ln -s /usr/sbin/sshd.pam /usr/sbin/sshd && \
+    mkdir -p /var/run/sshd && \
+    rm -f /etc/ssh/ssh_host_*key*
+
+COPY sshd_config /etc/ssh/sshd_config
+COPY create-sftp-user /usr/local/bin/
+COPY entrypoint /
+
+EXPOSE 2222
+
+ENTRYPOINT ["/entrypoint"]
