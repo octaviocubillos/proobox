@@ -75,6 +75,7 @@ download_image() {
   local image_version_arg="$2"
   local target_arch_arg="$3"
 
+
   distribution_name_arg=$(echo "$distribution_name_arg" | tr '[:upper:]' '[:lower:]')
 
   echo "--- Descargando Imagen ${distribution_name_arg^} ---"
@@ -116,6 +117,7 @@ download_image() {
 
   # Rutas de archivos locales
   local LOCAL_IMAGE_TAR_FILENAME="${distribution_name_arg}-${image_version_arg}.tar.gz"
+  echo "Archivo TAR local: $LOCAL_IMAGE_TAR_FILENAME"
   local LOCAL_IMAGE_JSON_FILENAME="${distribution_name_arg}-${image_version_arg}.json"
   local LOCAL_TAR_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_TAR_FILENAME"
   local LOCAL_JSON_PATH="$DOWNLOAD_IMAGES_DIR/$LOCAL_IMAGE_JSON_FILENAME"
@@ -139,14 +141,26 @@ download_image() {
   # --- Intentar descargar desde el Backend (SFTP vía HTTP) ---
   if [ -n "$BACKEND_URL" ] && [ "$BACKEND_URL" != "null" ]; then
     # Construir la ruta del objeto en el servidor SFTP (ej: "alpine/alpine-3.22.0.tar.gz")
-    local SFTP_OBJECT_TAR_PATH="${distribution_name_arg}/${LOCAL_IMAGE_TAR_FILENAME}"
+    local SFTP_OBJECT_TAR_PATH="${distribution_name_arg}-${image_version_arg}.tar.gz"
     local SFTP_OBJECT_JSON_PATH="${distribution_name_arg}/${LOCAL_IMAGE_JSON_FILENAME}"
 
+    local username_path=$(echo "$(echo "$1" | cut -d':' -f1)" | cut -d'/' -f1)
+    local image_name=$(echo "$(echo "$1" | cut -d':' -f1)" | cut -d'/' -f2)
+
+    echo "aaaaa/$username_path/$image_name/$image_version_arg/$image_name-$image_version_arg.tar.gz"
+    local repository_tar_path="proobox/$username_path/$image_name/$image_version_arg/$image_name-$image_version_arg.tar.gz"
+    local repository_json_path="proobox/$username_path/$image_name/$image_version_arg/$image_name-$image_version_arg.json"
+
+
     # Construir la URL de descarga del backend
-    local DOWNLOAD_BACKEND_URL_TAR="${BACKEND_URL}/images/download/${SFTP_OBJECT_TAR_PATH}"
-    local DOWNLOAD_BACKEND_URL_JSON="${BACKEND_URL}/images/download/${SFTP_OBJECT_JSON_PATH}"
+    local DOWNLOAD_BACKEND_URL_TAR="${BACKEND_URL}/api/download/${repository_tar_path}"
+    local DOWNLOAD_BACKEND_URL_JSON="${BACKEND_URL}/api/download/${repository_json_path}"
+
 
     echo "Intentando descargar de backend SFTP: $DOWNLOAD_BACKEND_URL_TAR"
+    echo "$LOCAL_TAR_PATH" "$LOCAL_JSON_PATH"
+    # mkdir -p "$LOCAL_TAR_PATH"
+    # mkdir -p "$LOCAL_JSON_PATH"
     wget -O "$LOCAL_TAR_PATH" "$DOWNLOAD_BACKEND_URL_TAR"
     if [ $? -eq 0 ]; then
       echo "Imagen TAR descargada de backend SFTP."
@@ -233,8 +247,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       }
 
       if [ -z "$1" ]; then show_help; return 0; fi
-
+      echo "Descargando imagen: $1"
       local distribution_name_cli=$(echo "$1" | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
+
+      echo "Distribución: $distribution_name_cli $(echo "$1" | cut -d'/' -f2)"
       local image_version_cli=$(echo "$1" | cut -d':' -f2)
       if [ -z "$image_version_cli" ] && [[ "$1" == *":"* ]]; then
           echo "Error: Si usa ':', debe especificar una versión completa. Ej: ubuntu:22.04.3" >&2
